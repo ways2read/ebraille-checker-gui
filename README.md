@@ -31,7 +31,9 @@ support on Windows, macOS, and Linux.
 - On macOS packaged builds, Finder **Open With** for `.ebrl` / `.epub` / `.pdf`
   (does not take over double-click by default)
 - Result-first UI: multi-line verdict with counts; colour cues (green / orange /
-  red) reinforce the text; issues listed by severity
+  red) reinforce the text; a status icon beside the result (click to select a
+  file); action column for **Copy summary**, **Report…**, **AI overview**, and
+  **Show/Hide issues**; issues listed by severity (panel starts collapsed)
 - Filter issues (all / errors / warnings / info); optional **Show one example
   of each issue** to collapse repeated codes with counts
 - Filter by source (**EPUBCheck + Ace**, or either tool alone) when both ran
@@ -42,19 +44,27 @@ support on Windows, macOS, and Linux.
   unlock stay in memory only). Validation itself stays offline. Requests show
   a cancellable progress dialog, check the provider connection first, and
   write diagnostics to the app log (**Help → Open debugging log…**).
-- **AI overview** (same FIDO AI gate): from the **Report** menu (or **Report…**
-  button), ask for a whole-report briefing — themes, priorities, and next steps
-  based on the unique issue codes (not a full file dump). View, save, or copy
-  the result like other AI replies.
-- **Fix with AI** (EPUB and eBraille only, when FIDO AI settings are present):
-  from the same issue details dialog, ask for a minimal proposed markup patch,
-  preview before/after, then **Apply fix** to the exploded folder or packaged
-  `.epub`/`.ebrl` (creates a `.bak` backup). The details dialog closes and the
+- **AI overview** (same FIDO AI gate): dedicated **AI overview** button (and
+  **Report** menu when AI is enabled); whole-report briefing — themes,
+  priorities, and next steps based on the unique issue codes (not a full file
+  dump). View, save, or copy the result like other AI replies. Toggle with
+  **Tools → Enable AI features** (hidden when FIDO AI is unavailable).
+- **Suggest fix with AI** (EPUB and eBraille only, when FIDO AI settings are present):
+  from the same issue details dialog, ask for a minimal suggested markup patch,
+  preview before/after, then **Apply fix and validate** to the exploded folder or packaged
+  `.epub`/`.ebrl` (creates a `.bak` backup).   When the report has more than one
+  issue with the same checker code, **Suggest all like this…** suggests up to 20
+  unique replacements across matching instances in one backup/rebuild cycle.
+  The details dialog closes and the
   publication is re-checked automatically. CheckMate then reports whether the
   targeted issue is gone, whether overall error/warning counts decreased, and
   (for Ace fixes) whether any new EPUBCheck errors appeared; if anything looks
-  wrong, it offers to revert from the backup. Packaged rewrite uses the same
-  EPUB-safe extract/rebuild approach as FIDO.
+  wrong, it offers to revert from the backup. Each applied fix also appends an
+  entry to a **edit changelog** beside the publication
+  (`book.epub.checkmate-changelog.md`, or `checkmate-changelog.md` inside an
+  exploded folder) naming the backup file, the issue fixed, and how to revert.
+  Open it from **Report → View edit changelog…** when present.
+  Packaged rewrite uses the same EPUB-safe extract/rebuild approach as FIDO.
 - Copy summary; view or save text / HTML reports (**Report** menu) — HTML
   reports embed an EPUB/eBraille cover image when present, or the first page
   of a PDF; **Clear results** returns to the launch state
@@ -134,8 +144,10 @@ uv run checkmate
    right-click an `.ebrl`, `.epub`, or `.pdf` → **Validate with CheckMate**,
    or **Open with** → CheckMate. On macOS, use Finder **Open With** for a
    packaged `.app`.
-2. Read the **Result** summary (focus moves there when a check finishes), then
-   review **Issues** (filterable).
+2. While a check runs, the **Result** pane shows living progress (Ace streams
+   document status; other tools show elapsed time). When finished, focus moves
+   to the summary; expand **Show issues** to review the list (filterable), or enable
+   **Tools → Show issues always** to open the list automatically after checks that find issues.
 3. Use **Report → View full log** (`Ctrl+L`) only when you need the raw
    checker output.
 4. **Tools → Re-check publication** (`F5`) re-runs the current path after you
@@ -155,6 +167,7 @@ versions and Java information.
 |---|---|
 | `Ctrl+O` | Select file |
 | `Ctrl+Shift+O` | Select folder |
+| `Ctrl+Tab` | Leave AI explanation WebView (details/overview dialogs) |
 | `F5` | Re-check current publication |
 | `Ctrl+T` | View text report |
 | `Ctrl+Shift+S` | Save text report |
@@ -189,7 +202,7 @@ Under that folder:
 - `checker/` — downloaded or updated eBraille Checker releases
 - `epubcheck/` — downloaded or updated EPUBCheck releases
 - `verapdf/` — downloaded or updated veraPDF CLI installs
-- `settings.json` — remembered UI language
+- `settings.json` — remembered UI language and preferences (e.g. Show issues always)
 
 Packaged builds also include `checker/`, `epubcheck/`, and `verapdf/` beside the
 executable (or inside the `.app` bundle on macOS).
@@ -205,7 +218,13 @@ executable (or inside the `.app` bundle on macOS).
   announce it; arrow keys then allow line/character review
 - **Explain with AI** prefers an Edge/WebKit `WebView` so the reply is real HTML
   (headings, lists, links) for screen readers; falls back to a Markdown text
-  field if no webview backend is available (`HtmlWindow` is not used)
+  field if no webview backend is available (`HtmlWindow` is not used). The
+  details/overview dialogs keep the WebView in the Tab cycle so focus can
+  return after leaving the pane. After Explain/Fix, the dialog reclaims
+  foreground focus so the explanation is reachable without Alt+Tab. Inside the
+  explanation, Tab starts at the top then moves between links (keyboard focus
+  is armed without a mouse click); Tab after the last link (or **Ctrl+Tab**)
+  leaves the WebView for the next dialog control.
 - Accessible name includes the verdict text; the window title also appends it
 - **Language** menu: English, Français, Español, Deutsch, Português, Dansk,
   Nederlands, Suomi, हिन्दी, Norsk, Русский, Svenska
@@ -324,6 +343,7 @@ checkmate/
     java_util.py       # Locate Java (bundled or PATH)
     models.py          # Verdict and issue models
     report_export.py   # Text / HTML report export
+    telemetry.py       # FIDO-consent usage telemetry (shared secrets/sender)
     i18n.py            # UI language registry + core translations
     i18n_extra.py      # Additional language catalogs (da/nl/fi/hi/nb/ru/sv)
     settings.py        # Persisted preferences
@@ -461,8 +481,9 @@ Output: `installer/Output/CheckMate-<version>-setup.exe`
 The installer:
 
 - Ships the full onedir tree (GUI + Temurin JRE 17 + eBraille Checker +
-  EPUBCheck, veraPDF) — no system Java (`build_installer.ps1` refuses to compile if
-  `runtime/`, `checker/`, `epubcheck/`, or `verapdf/` is missing from `dist/`)
+  EPUBCheck, veraPDF, Ace, status icons) — no system Java
+  (`build_installer.ps1` refuses to compile if `runtime/`, `checker/`,
+  `epubcheck/`, `verapdf/`, or `ace/` is missing from `dist/`)
 - Supports per-user install (default) or Program Files with elevation
 - Adds `.ebrl` / `.epub` / `.pdf` shell integration (optional task, on by default):
   **Open with** → CheckMate, and context menu **Validate with

@@ -37,11 +37,17 @@ from .paths import (
     EPUBCHECK_REPO_PAGE,
     VERAPDF_HOME_PAGE,
     application_dir,
+    images_dir,
     is_frozen,
 )
 from .publication import is_checkable_path
 from .report_export import format_text_report, report_title, save_report
-from .settings import read_settings, update_settings
+from .settings import (
+    ai_features_enabled,
+    read_settings,
+    show_issues_always,
+    update_settings,
+)
 from .updater import (
     EBRAILLE_TOOL,
     EPUBCHECK_TOOL,
@@ -75,7 +81,8 @@ def _create_ai_html_view(parent: wx.Window) -> tuple[wx.Window, bool]:
     readers can browse. Fall back to a read-only TextCtrl when no backend works.
 
     ``wx.html.HtmlWindow`` is avoided: it has poor accessibility and can trap
-    focus / Escape inside modal dialogs.
+    focus / Escape inside modal dialogs. Escape/Tab exit are handled in-page via
+    ``checkmate://`` navigations so WebView2 cannot swallow those keys.
     """
     try:
         import wx.html2 as html2
@@ -85,12 +92,10 @@ def _create_ai_html_view(parent: wx.Window) -> tuple[wx.Window, bool]:
     if html2 is not None:
         backends: list[object] = []
         if sys.platform == "win32":
-            backends.extend(
-                [
-                    getattr(html2, "WebViewBackendEdge", None),
-                    getattr(html2, "WebViewBackendIE", None),
-                ]
-            )
+            # Edge/WebView2 only — do not fall back to IE. The IE backend's
+            # RunScriptAsync is a stub that only logs "RunScriptAsync not
+            # supported" (shown as a wx error dialog), and IE a11y is poor.
+            backends.append(getattr(html2, "WebViewBackendEdge", None))
         else:
             backends.append(getattr(html2, "WebViewBackendWebKit", None))
         backends.append(None)  # platform default
@@ -104,6 +109,17 @@ def _create_ai_html_view(parent: wx.Window) -> tuple[wx.Window, bool]:
                     continue
             try:
                 if backend is None:
+                    # On Windows, skip the anonymous default if it would be IE.
+                    if sys.platform == "win32":
+                        edge = getattr(html2, "WebViewBackendEdge", None)
+                        if edge is not None and hasattr(
+                            html2.WebView, "IsBackendAvailable"
+                        ):
+                            try:
+                                if not html2.WebView.IsBackendAvailable(edge):
+                                    continue
+                            except Exception:
+                                continue
                     view = html2.WebView.New(parent)
                 else:
                     view = html2.WebView.New(parent, backend=backend)
@@ -117,12 +133,11 @@ def _create_ai_html_view(parent: wx.Window) -> tuple[wx.Window, bool]:
                     view.SetAccessibleName(_("AI explanation"))
                 except Exception:
                     pass
-            # Keep keyboard focus usable; do not open a new window for target=_blank.
             try:
                 view.EnableContextMenu(True)
             except Exception:
                 pass
-            _ensure_win_tab_stop(view)
+            # Tab-stop ownership is decided in ``_wire_ai_html_host``.
             return view, True
 
     text = wx.TextCtrl(
@@ -134,6 +149,7 @@ def _create_ai_html_view(parent: wx.Window) -> tuple[wx.Window, bool]:
         | wx.BORDER_SUNKEN,
         name=_("AI explanation"),
     )
+    _ensure_win_tab_stop(text)
     return text, False
 
 
@@ -189,6 +205,181 @@ def _win_clear_tab_stop(window: wx.Window) -> None:
         pass
 
 
+def _win_ensure_control_parent(window: wx.Window) -> None:
+    """Ensure WS_EX_CONTROLPARENT so dialog Tab traversal enters this container."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        hwnd = int(window.GetHandle())
+        if not hwnd:
+            return
+        gwl_exstyle = -20
+        ws_ex_controlparent = 0x00010000
+        user32 = ctypes.windll.user32
+        ex = int(user32.GetWindowLongW(hwnd, gwl_exstyle))
+        if ex & ws_ex_controlparent:
+            return
+        user32.SetWindowLongW(hwnd, gwl_exstyle, ex | ws_ex_controlparent)
+    except Exception:
+        pass
+
+
+def _win_clear_control_parent(window: wx.Window) -> None:
+    """
+    Remove WS_EX_CONTROLPARENT so the window itself can be a dialog Tab stop.
+
+    With CONTROLPARENT set, Windows ``GetNextDlgTabItem`` searches children and
+    skips the parent — so a host with no tab-stop children (WebView chrome
+    cleared) is jumped over entirely.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        hwnd = int(window.GetHandle())
+        if not hwnd:
+            return
+        gwl_exstyle = -20
+        ws_ex_controlparent = 0x00010000
+        user32 = ctypes.windll.user32
+        ex = int(user32.GetWindowLongW(hwnd, gwl_exstyle))
+        if not (ex & ws_ex_controlparent):
+            return
+        user32.SetWindowLongW(hwnd, gwl_exstyle, ex & ~ws_ex_controlparent)
+    except Exception:
+        pass
+
+
+def _win_force_foreground(window: wx.Window) -> None:
+    """Restore Win32 foreground after a modal ProgressDialog tears down."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        hwnd = int(window.GetHandle() or 0)
+        if not hwnd:
+            return
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        fg = int(user32.GetForegroundWindow() or 0)
+        if fg == hwnd:
+            return
+        this_thread = int(kernel32.GetCurrentThreadId())
+        fg_thread = 0
+        if fg:
+            fg_thread = int(user32.GetWindowThreadProcessId(fg, None))
+        attached = False
+        if fg_thread and fg_thread != this_thread:
+            attached = bool(user32.AttachThreadInput(this_thread, fg_thread, True))
+        try:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(this_thread, fg_thread, False)
+    except Exception:
+        pass
+
+
+def _webview_host_action(url: str) -> str | None:
+    """
+    Return host action for in-page ``checkmate://`` navigations, else None.
+
+    ``next`` / ``prev`` move dialog focus out of the WebView; ``close`` closes
+    the modal. Edge may append a slash or empty path segment.
+    """
+    u = (url or "").strip().lower()
+    if u.startswith("checkmate://focus-next"):
+        return "next"
+    if u.startswith("checkmate://focus-prev"):
+        return "prev"
+    if u.startswith("checkmate://close"):
+        return "close"
+    return None
+
+
+def _try_set_focus(window: wx.Window | None) -> bool:
+    """
+    Focus a wx control, stealing Win32 focus from an Edge document HWND if needed.
+
+    Plain ``SetFocus()`` often fails to pull keyboard focus out of
+    ``Chrome_RenderWidgetHostHWND``; dialog-manager + ``user32.SetFocus`` do.
+    """
+    if window is None:
+        return False
+    try:
+        if not window or not window.IsEnabled() or not window.IsShown():
+            return False
+        _win_dialog_focus_hwnd(window)
+        window.SetFocus()
+        if sys.platform == "win32":
+            import ctypes
+
+            hwnd = int(window.GetHandle() or 0)
+            if hwnd:
+                ctypes.windll.user32.SetFocus(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+def _present_progress_dialog(dlg: wx.Window, message: str) -> None:
+    """Pulse, raise, and focus a ProgressDialog so screen readers announce it."""
+    try:
+        if hasattr(dlg, "Pulse"):
+            dlg.Pulse(message)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        dlg.Raise()
+        dlg.Show(True)
+    except Exception:
+        return
+    _win_force_foreground(dlg)
+
+    def _try_focus(window: wx.Window) -> bool:
+        try:
+            if not window or not window.GetHandle():
+                return False
+            window.SetFocus()
+            return True
+        except Exception:
+            # MSW ProgressDialog children can report as focusable while their
+            # HWND is still invalid (wxAssertionError from SetFocus).
+            return False
+
+    # Prefer an interactive child so NVDA announces the dialog; frame-only
+    # focus often produces silence. Never let focus failures abort Explain.
+    try:
+        focused = False
+        for child in dlg.GetChildren():
+            if not isinstance(child, wx.Window):
+                continue
+            try:
+                wants = child.AcceptsFocusFromKeyboard()
+            except Exception:
+                continue
+            if wants and _try_focus(child):
+                focused = True
+                break
+        if not focused:
+            _try_focus(dlg)
+    except Exception:
+        pass
+    try:
+        wx.SafeYield(dlg)
+    except Exception:
+        try:
+            wx.Yield()
+        except Exception:
+            pass
+
+
 def _win_webview_document_hwnd(root_hwnd: int) -> int | None:
     """
     Inner document HWND for Edge WebView2 / IE (needed for screen-reader focus).
@@ -225,58 +416,523 @@ def _win_webview_document_hwnd(root_hwnd: int) -> int | None:
         return None
 
 
-def _focus_ai_html_view(
+def _win_get_focus_hwnd() -> int:
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+
+        return int(ctypes.windll.user32.GetFocus() or 0)
+    except Exception:
+        return 0
+
+
+def _win_focus_is_webview_document(view: wx.Window) -> bool:
+    """True when Win32 focus is already inside the WebView document."""
+    try:
+        outer = int(view.GetHandle() or 0)
+    except RuntimeError:
+        return False
+    doc = _win_webview_document_hwnd(outer)
+    return bool(doc) and _win_get_focus_hwnd() == doc
+
+
+def _tab_into_webview_direction() -> str:
+    """Return 'next' (Tab) or 'prev' (Shift+Tab) for entry into the WebView."""
+    try:
+        if wx.GetKeyState(wx.WXK_SHIFT):
+            return "prev"
+    except Exception:
+        pass
+    return "next"
+
+
+# Edge WebView2 MoveFocus reasons (ICoreWebView2Controller::MoveFocus).
+_COREWEBVIEW2_MOVE_FOCUS_PROGRAMMATIC = 0
+_COREWEBVIEW2_MOVE_FOCUS_NEXT = 1
+_COREWEBVIEW2_MOVE_FOCUS_PREVIOUS = 2
+
+# ICoreWebView2Controller IID — MoveFocus lives here, not on ICoreWebView2
+# (wx GetNativeBackend returns the latter).
+_IID_ICOREWEBVIEW2_CONTROLLER = (
+    0x4D00C0D1,
+    0x9434,
+    0x4EB6,
+    (0x80, 0x78, 0x86, 0x97, 0xA5, 0x60, 0x33, 0x4F),
+)
+
+
+def _win_webview_controller_move_focus(view: wx.Window, reason: int) -> bool:
+    """
+    Call ICoreWebView2Controller::MoveFocus when possible.
+
+    wx OnSetFocus only uses PROGRAMMATIC. Tabbing into a host panel then
+    SetFocus()'ing the WebView never runs NEXT/PREVIOUS, so Edge can leave
+    keyboard input in limbo until a mouse click. Prefer NEXT/PREVIOUS on Tab.
+    """
+    if sys.platform != "win32":
+        return False
+    get_native = getattr(view, "GetNativeBackend", None)
+    if not callable(get_native):
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        raw = get_native()
+        if raw is None:
+            return False
+        ptr = int(raw)
+        if not ptr:
+            return False
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        iid = GUID()
+        iid.Data1 = _IID_ICOREWEBVIEW2_CONTROLLER[0]
+        iid.Data2 = _IID_ICOREWEBVIEW2_CONTROLLER[1]
+        iid.Data3 = _IID_ICOREWEBVIEW2_CONTROLLER[2]
+        for i, b in enumerate(_IID_ICOREWEBVIEW2_CONTROLLER[3]):
+            iid.Data4[i] = b
+
+        # IUnknown::QueryInterface on the native ICoreWebView2* (usually fails —
+        # controller is a sibling object — but cheap to try).
+        this = ctypes.c_void_p(ptr)
+        vtbl = ctypes.cast(this, ctypes.POINTER(ctypes.c_void_p)).contents
+        vtbl_ptrs = ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))
+        qi = ctypes.CFUNCTYPE(
+            ctypes.HRESULT,
+            ctypes.c_void_p,
+            ctypes.POINTER(GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+        )(vtbl_ptrs[0])
+        controller = ctypes.c_void_p()
+        hr = qi(this, ctypes.byref(iid), ctypes.byref(controller))
+        if hr != 0 or not controller.value:
+            return False
+
+        c_this = controller
+        c_vtbl = ctypes.cast(c_this, ctypes.POINTER(ctypes.c_void_p)).contents
+        c_ptrs = ctypes.cast(c_vtbl, ctypes.POINTER(ctypes.c_void_p))
+        # IUnknown(3) + get/put IsVisible(2) + Bounds(2) + Zoom(2) +
+        # zoom events(2) + SetBoundsAndZoomFactor(1) + MoveFocus = index 12.
+        move_focus = ctypes.CFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p, ctypes.c_int
+        )(c_ptrs[12])
+        hr = move_focus(c_this, int(reason))
+        # Release the QI'd controller pointer.
+        release = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(c_ptrs[2])
+        release(c_this)
+        return hr == 0
+    except Exception:
+        return False
+
+
+def _win_webview_synthetic_click(doc_hwnd: int) -> bool:
+    """
+    Arm Edge keyboard input with a client-area click.
+
+    DOM focus / scroll alone is not enough: until WebView2 receives a real
+    activation (MoveFocus NEXT/PREVIOUS or a mouse click), Tab keys stay in
+    limbo. Click the top-left padding (body has 1rem padding) so we do not
+    activate a link.
+    """
+    if sys.platform != "win32" or not doc_hwnd:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        WM_LBUTTONDOWN = 0x0201
+        WM_LBUTTONUP = 0x0202
+        MK_LBUTTON = 0x0001
+        rect = wintypes.RECT()
+        if not user32.GetClientRect(int(doc_hwnd), ctypes.byref(rect)):
+            return False
+        if rect.right < 4 or rect.bottom < 4:
+            return False
+        x, y = 2, 2
+        lp = (y << 16) | (x & 0xFFFF)
+        user32.SetFocus(int(doc_hwnd))
+        # Synchronous so the click finishes before follow-up DOM focus JS.
+        user32.SendMessageW(int(doc_hwnd), WM_LBUTTONDOWN, MK_LBUTTON, lp)
+        user32.SendMessageW(int(doc_hwnd), WM_LBUTTONUP, 0, lp)
+        return True
+    except Exception:
+        return False
+
+
+def _win_dialog_focus_hwnd(ctrl: wx.Window) -> bool:
+    """Focus a control via WM_NEXTDLGCTL (dialog-manager path, not SetFocus)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        hwnd = int(ctrl.GetHandle() or 0)
+        if not hwnd:
+            return False
+        top = ctrl.GetTopLevelParent()
+        top_hwnd = int(top.GetHandle() or 0) if top else 0
+        if not top_hwnd:
+            return False
+        WM_NEXTDLGCTL = 0x0028
+        ctypes.windll.user32.SendMessageW(top_hwnd, WM_NEXTDLGCTL, hwnd, 1)
+        return True
+    except Exception:
+        return False
+
+
+# On Tab entry: scroll to top and focus the document body so reading starts at
+# the beginning. Do not jump to the first link (next Tab reaches links).
+# Shift+Tab entry focuses the last link instead.
+_WEBVIEW_ACTIVATE_DOM_JS_NEXT = """
+(function () {
+  try {
+    var body = document.body;
+    if (!body) { return 'none'; }
+    if (!(body.tabIndex < 0)) { body.tabIndex = -1; }
+    var active = document.activeElement;
+    var onChrome = !active
+      || active === body
+      || active === document.documentElement;
+    if (!onChrome) { return 'kept'; }
+    window.scrollTo(0, 0);
+    if (document.documentElement) {
+      document.documentElement.scrollTop = 0;
+    }
+    body.scrollTop = 0;
+    body.focus();
+    return 'body';
+  } catch (e) {
+    return 'err';
+  }
+})();
+""".strip()
+
+# After a follow-up answer reloads the page: put the newest question at the top
+# of the viewport and move document focus there for screen readers.
+_WEBVIEW_REVEAL_LATEST_FOLLOWUP_JS = """
+(function () {
+  try {
+    var el = document.getElementById('cm-latest-followup');
+    if (!el) { return 'none'; }
+    if (!(el.tabIndex < 0)) { el.tabIndex = -1; }
+    try {
+      var top = 0;
+      try {
+        var rect = el.getBoundingClientRect();
+        top = (window.pageYOffset || document.documentElement.scrollTop || 0)
+          + rect.top - 12;
+      } catch (e0) {
+        top = el.offsetTop || 0;
+      }
+      if (top < 0) top = 0;
+      window.scrollTo(0, top);
+      if (document.documentElement) {
+        document.documentElement.scrollTop = top;
+      }
+      if (document.body) {
+        document.body.scrollTop = top;
+      }
+      el.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
+    } catch (e) {
+      try { el.scrollIntoView(true); } catch (e2) {}
+    }
+    try {
+      el.focus({ preventScroll: true });
+    } catch (e3) {
+      try { el.focus(); } catch (e4) {}
+    }
+    return 'latest';
+  } catch (e5) {
+    return 'err';
+  }
+})();
+""".strip()
+
+_WEBVIEW_ACTIVATE_DOM_JS_PREV = """
+(function () {
+  try {
+    var body = document.body;
+    if (!body) { return 'none'; }
+    if (!(body.tabIndex < 0)) { body.tabIndex = -1; }
+    var active = document.activeElement;
+    var onChrome = !active
+      || active === body
+      || active === document.documentElement;
+    if (!onChrome) { return 'kept'; }
+    var list = Array.prototype.slice.call(document.querySelectorAll(
+      'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    )).filter(function (el) {
+      if (el.disabled) return false;
+      if (el.getAttribute('aria-hidden') === 'true') return false;
+      var rects = el.getClientRects();
+      return rects && rects.length > 0;
+    });
+    if (list.length) {
+      list[list.length - 1].focus();
+      return 'last';
+    }
+    body.focus();
+    return 'body';
+  } catch (e) {
+    return 'err';
+  }
+})();
+""".strip()
+
+# Back-compat alias used by older call sites / mental model.
+_WEBVIEW_ACTIVATE_DOM_JS = _WEBVIEW_ACTIVATE_DOM_JS_NEXT
+
+
+def _webview_activate_dom_js(direction: str) -> str:
+    if direction == "prev":
+        return _WEBVIEW_ACTIVATE_DOM_JS_PREV
+    return _WEBVIEW_ACTIVATE_DOM_JS_NEXT
+
+
+def _webview_run_script(view: wx.Window, script: str) -> bool:
+    """Run JavaScript in a wx.html2.WebView; tolerate API shape differences."""
+    # Prefer sync RunScript. The base wxWebView::RunScriptAsync only calls
+    # wxLogError("RunScriptAsync not supported") without raising (IE / stubs),
+    # which pops an error dialog and looks like success to Python callers.
+    sync_fn = getattr(view, "RunScript", None)
+    if callable(sync_fn):
+        try:
+            with wx.LogNull():
+                sync_fn(script)
+            return True
+        except TypeError:
+            try:
+                out: list[str] = []
+                with wx.LogNull():
+                    sync_fn(script, out)
+                return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+    async_fn = getattr(view, "RunScriptAsync", None)
+    if callable(async_fn):
+        try:
+            with wx.LogNull():
+                async_fn(script)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _markdown_has_latest_followup(markdown_text: str) -> bool:
+    return 'id="cm-latest-followup"' in (markdown_text or "")
+
+
+def _reveal_latest_followup_in_webview(
     view: wx.Window,
     *,
-    is_webview: bool,
-    retries: int = 10,
-) -> None:
+    retries: int = 8,
+) -> bool:
     """
-    Put keyboard focus into the AI HTML pane (and its document HWND on Windows).
+    Activate the WebView document and scroll/focus ``#cm-latest-followup``.
+
+    Returns True when activation was attempted successfully enough to stop
+    retrying. Unlike Tab-entry activation, this does not scroll to the top.
     """
     try:
         if not view:
-            return
+            return False
     except RuntimeError:
-        return
-    try:
-        view.SetFocus()
-    except RuntimeError:
-        return
-    if not is_webview:
-        if hasattr(view, "SetInsertionPoint"):
-            try:
-                view.SetInsertionPoint(0)
-            except RuntimeError:
-                pass
-        return
+        return False
 
-    _ensure_win_tab_stop(view)
+    already_doc = sys.platform == "win32" and _win_focus_is_webview_document(view)
+    if not already_doc:
+        try:
+            _win_dialog_focus_hwnd(view)
+            view.SetFocus()
+        except RuntimeError:
+            return False
+        if not _win_webview_controller_move_focus(
+            view, _COREWEBVIEW2_MOVE_FOCUS_PROGRAMMATIC
+        ):
+            _win_webview_controller_move_focus(
+                view, _COREWEBVIEW2_MOVE_FOCUS_NEXT
+            )
+
     if sys.platform != "win32":
-        return
+        _webview_run_script(view, _WEBVIEW_REVEAL_LATEST_FOLLOWUP_JS)
+        return True
+
     try:
         import ctypes
 
         outer = int(view.GetHandle() or 0)
         doc = _win_webview_document_hwnd(outer)
         if doc:
-            # Refocus the wx wrapper once the document HWND exists (propagates
-            # into Edge), then focus the document itself for screen readers.
-            try:
-                view.SetFocus()
-            except RuntimeError:
-                pass
-            ctypes.windll.user32.SetFocus(doc)
-            return
+            if not already_doc:
+                ctypes.windll.user32.SetFocus(doc)
+            _webview_run_script(view, _WEBVIEW_REVEAL_LATEST_FOLLOWUP_JS)
+            # Arm Edge keyboard, then re-apply scroll/focus (click lands at 2,2).
+            if not already_doc:
+                _win_webview_synthetic_click(doc)
+                _webview_run_script(view, _WEBVIEW_REVEAL_LATEST_FOLLOWUP_JS)
+            return True
     except Exception:
         pass
+
     if retries > 0:
         wx.CallLater(
-            50,
-            lambda v=view, n=retries: _focus_ai_html_view(
-                v, is_webview=True, retries=n - 1
+            100,
+            lambda v=view, n=retries: _reveal_latest_followup_in_webview(
+                v, retries=n - 1
             ),
         )
+        return False
+
+    _webview_run_script(view, _WEBVIEW_REVEAL_LATEST_FOLLOWUP_JS)
+    return False
+
+
+def _focus_ai_html_view(
+    view: wx.Window,
+    *,
+    is_webview: bool,
+    retries: int = 10,
+    direction: str | None = None,
+    arm_keyboard: bool | None = None,
+) -> bool:
+    """
+    Put keyboard focus into the AI HTML pane (and its document HWND on Windows).
+
+    Returns True when activation was attempted successfully enough to stop
+    retrying. Edge needs Win32 focus plus a DOM focus target; avoid calling
+    ``view.SetFocus()`` when the document already has focus (that re-enters
+    SET_FOCUS handlers and loops).
+
+    When entering from outside the document, also arm WebView2 keyboard input
+    (MoveFocus NEXT/PREVIOUS and/or a synthetic client click). DOM scroll/focus
+    alone leaves Tab in limbo until a mouse click.
+    """
+    try:
+        if not view:
+            return False
+    except RuntimeError:
+        return False
+
+    if not is_webview:
+        try:
+            view.SetFocus()
+        except RuntimeError:
+            return False
+        if hasattr(view, "SetInsertionPoint"):
+            try:
+                view.SetInsertionPoint(0)
+            except RuntimeError:
+                pass
+        return True
+
+    already_doc = sys.platform == "win32" and _win_focus_is_webview_document(view)
+    if direction is None:
+        direction = _tab_into_webview_direction()
+    if arm_keyboard is None:
+        # Only force Edge keyboard arming when Tabbing in from outside.
+        arm_keyboard = not already_doc
+
+    if not already_doc:
+        try:
+            # Prefer dialog-manager focus so WebView2 can treat Tab as NEXT.
+            _win_dialog_focus_hwnd(view)
+            view.SetFocus()
+        except RuntimeError:
+            return False
+        move_reason = (
+            _COREWEBVIEW2_MOVE_FOCUS_PREVIOUS
+            if direction == "prev"
+            else _COREWEBVIEW2_MOVE_FOCUS_NEXT
+        )
+        if not _win_webview_controller_move_focus(view, move_reason):
+            # wx OnSetFocus already tried PROGRAMMATIC; still attempt it again.
+            _win_webview_controller_move_focus(
+                view, _COREWEBVIEW2_MOVE_FOCUS_PROGRAMMATIC
+            )
+
+    dom_js = _webview_activate_dom_js(direction)
+
+    if sys.platform != "win32":
+        _webview_run_script(view, dom_js)
+        return True
+
+    try:
+        import ctypes
+
+        outer = int(view.GetHandle() or 0)
+        doc = _win_webview_document_hwnd(outer)
+        if doc:
+            if not already_doc:
+                ctypes.windll.user32.SetFocus(doc)
+            _webview_run_script(view, dom_js)
+            # MoveFocus alone is often unavailable (controller QI fails). A
+            # one-shot client click arms Edge keyboard on Tab-in; Escape and
+            # Tab-boundary navigations then exit via checkmate:// handlers.
+            if arm_keyboard and not already_doc:
+                _win_webview_synthetic_click(doc)
+                _webview_run_script(view, dom_js)
+            return True
+    except Exception:
+        pass
+
+    if retries > 0:
+        wx.CallLater(
+            100,
+            lambda v=view, n=retries, d=direction, a=arm_keyboard: _focus_ai_html_view(
+                v,
+                is_webview=True,
+                retries=n - 1,
+                direction=d,
+                arm_keyboard=a,
+            ),
+        )
+        return False
+
+    _webview_run_script(view, dom_js)
+    return False
+
+
+def _refresh_ai_html_tab_stops(
+    host: wx.Window,
+    view: wx.Window,
+    *,
+    is_webview: bool,
+) -> None:
+    """
+    Keep a single dialog Tab stop for the AI HTML pane.
+
+    Edge WebView2's outer HWND often accepts dialog focus without activating the
+    document, so Tab appears to skip the pane. The host panel is the stable
+    WS_TABSTOP (and must NOT be WS_EX_CONTROLPARENT, or Windows skips it while
+    searching empty children). Focus is then forwarded into the document HWND.
+    """
+    if is_webview:
+        # Leaf tab-stop: dialog manager must focus the host itself.
+        if host.HasFlag(wx.TAB_TRAVERSAL):
+            host.ToggleWindowStyle(wx.TAB_TRAVERSAL)
+        _win_clear_control_parent(host)
+        _ensure_win_tab_stop(host)
+        _win_clear_tab_stop(view)
+    else:
+        # TextCtrl child must be reachable via CONTROLPARENT recursion.
+        if not host.HasFlag(wx.TAB_TRAVERSAL):
+            host.ToggleWindowStyle(wx.TAB_TRAVERSAL)
+        _win_ensure_control_parent(host)
+        _win_clear_tab_stop(host)
+        _ensure_win_tab_stop(view)
 
 
 def _wire_ai_html_host(
@@ -285,24 +941,132 @@ def _wire_ai_html_host(
     *,
     is_webview: bool,
 ) -> None:
-    """Host panel must not steal Tab; forward accidental focus to the view."""
-    _win_clear_tab_stop(host)
-    _ensure_win_tab_stop(view)
+    """
+    Put the AI HTML pane in the Tab cycle.
 
-    def _on_host_focus(_event: wx.FocusEvent) -> None:
-        _focus_ai_html_view(view, is_webview=is_webview, retries=6)
+    For WebView, the host panel is the keyboard surface (Escape / Tab stay in
+    wx). Enter/Space activates Edge for in-page link browsing; in-page JS then
+    exits via ``checkmate://``. Auto-diving into the document on Tab creates a
+    focus limbo where neither wx nor Edge receives keys.
+
+    For the TextCtrl fallback, the text control itself remains the Tab stop.
+    """
+    if isinstance(host, _AiHtmlHostPanel):
+        host.bind_ai_view(view, is_webview=is_webview)
+    _refresh_ai_html_tab_stops(host, view, is_webview=is_webview)
+
+    if is_webview:
+        tip = _(
+            "AI explanation: Tab moves to the next control; Enter activates the "
+            "page to browse links. Escape closes this dialog. Inside the page, "
+            "Tab after the last link (or Ctrl+Tab) returns to the dialog."
+        )
+        try:
+            host.SetToolTip(tip)
+            view.SetToolTip(tip)
+        except Exception:
+            pass
+
+        def _dialog() -> wx.Window | None:
+            try:
+                return host.GetTopLevelParent()
+            except RuntimeError:
+                return None
+
+        def _on_host_char_hook(event: wx.KeyEvent) -> None:
+            key = event.GetKeyCode()
+            dlg = _dialog()
+            if key == wx.WXK_ESCAPE:
+                if dlg is not None and hasattr(dlg, "_on_close_dialog"):
+                    dlg._on_close_dialog(event)  # type: ignore[attr-defined]
+                    return
+            if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER, wx.WXK_SPACE):
+                _focus_ai_html_view(
+                    view,
+                    is_webview=True,
+                    retries=2,
+                    direction="next",
+                    arm_keyboard=True,
+                )
+                return
+            event.Skip()
+
+        host.Bind(wx.EVT_CHAR_HOOK, _on_host_char_hook)
+        return
+
+    # TextCtrl: forward host focus into the read-only text pane.
+    focusing = {"busy": False}
+
+    def _push_focus() -> None:
+        if focusing["busy"]:
+            return
+        focusing["busy"] = True
+        try:
+            _focus_ai_html_view(view, is_webview=False, retries=2)
+        finally:
+            wx.CallAfter(lambda: focusing.__setitem__("busy", False))
+
+    def _on_host_focus(event: wx.FocusEvent) -> None:
+        event.Skip()
+        wx.CallAfter(_push_focus)
 
     host.Bind(wx.EVT_SET_FOCUS, _on_host_focus)
 
 
 class _AiHtmlHostPanel(wx.Panel):
-    """Deferred WebView container — never keeps keyboard focus itself."""
+    """
+    Deferred WebView container.
+
+    Before the view exists it stays out of the Tab cycle. Once wired for a
+    WebView it becomes the dialog Tab stop and keeps keyboard focus in wx
+    (Enter activates the Edge document for link browsing).
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        # Avoid default wxTAB_TRAVERSAL / WS_EX_CONTROLPARENT until we know
+        # whether this hosts a WebView (leaf tab-stop) or a TextCtrl.
+        if "style" not in kwargs:
+            kwargs["style"] = wx.BORDER_NONE
+        super().__init__(*args, **kwargs)
+        self._ai_view: wx.Window | None = None
+        self._ai_is_webview = False
+        self._accept_kbd_focus = False
+
+    def bind_ai_view(self, view: wx.Window, *, is_webview: bool) -> None:
+        self._ai_view = view
+        self._ai_is_webview = bool(is_webview)
+        # WebView: host is the Tab gate. Text fallback: child TextCtrl is.
+        self._accept_kbd_focus = bool(is_webview)
+        _refresh_ai_html_tab_stops(self, view, is_webview=self._ai_is_webview)
 
     def AcceptsFocus(self) -> bool:  # noqa: N802 — wx override
-        return False
+        return self._accept_kbd_focus
 
     def AcceptsFocusFromKeyboard(self) -> bool:  # noqa: N802 — wx override
-        return False
+        return self._accept_kbd_focus
+
+    def AcceptsFocusRecursively(self) -> bool:  # noqa: N802 — wx override
+        # WebView gate is a leaf: do not search (non-tab-stop) children.
+        if self._ai_is_webview:
+            return False
+        return super().AcceptsFocusRecursively()
+
+    def SetFocusFromKbd(self) -> None:  # noqa: N802 — wx override
+        """Tab lands on the host; keep focus here (do not auto-dive into Edge)."""
+        if self._ai_is_webview:
+            try:
+                self.SetFocus()
+            except RuntimeError:
+                pass
+            return
+        view = self._ai_view
+        if view is not None:
+            try:
+                view.SetFocus()
+            except RuntimeError:
+                pass
+            return
+        super().SetFocusFromKbd()
 
 
 def _macos_make_first_responder(window: wx.Window) -> bool:
@@ -531,12 +1295,20 @@ class IssueDetailDialog(wx.Dialog):
         self._ai_focus_after_load = False
         self._ai_view_realized = False
         self._fix_proposal = None
+        self._batch_proposal = None
         self.applied_fix_verify = None
         self._ai_cancel: threading.Event | None = None
         self._ai_progress: wx.ProgressDialog | None = None
         self._ai_progress_timer: wx.Timer | None = None
-        self._show_ai = fido_settings_present()
+        self._show_ai = ai_features_enabled()
         self._show_fix = self._show_ai and self._fix_available_for_result(check_result)
+        self._matching_like_this = 1
+        if self._show_fix and check_result is not None:
+            from .ai.context import issues_matching_seed
+
+            self._matching_like_this = max(
+                1, len(issues_matching_seed(issue, check_result))
+            )
         if self._show_ai:
             self.SetSize((780, 760))
             self.SetMinSize((700, 520))
@@ -595,14 +1367,25 @@ class IssueDetailDialog(wx.Dialog):
             top_row.Add(self.explain_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
 
             if self._show_fix:
-                self.fix_btn = wx.Button(self, label=_("Fix with AI"))
+                self.fix_btn = wx.Button(self, label=_("Suggest fix with AI"))
                 self.fix_btn.SetToolTip(
                     _(
-                        "Ask AI to propose a minimal markup fix for this EPUB "
+                        "Ask AI to suggest a minimal markup fix for this EPUB "
                         "or eBraille issue (uses FIDO AI settings)"
                     )
                 )
                 top_row.Add(self.fix_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+                self.fix_all_btn = wx.Button(self, label=_("Suggest all like this…"))
+                self.fix_all_btn.SetToolTip(
+                    _(
+                        "Ask AI to suggest unique fixes for every issue with the "
+                        "same checker code in this report (uses FIDO AI settings)"
+                    )
+                )
+                self.fix_all_btn.Enable(self._matching_like_this > 1)
+                top_row.Add(
+                    self.fix_all_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8
+                )
 
             model_label = wx.StaticText(self, label=_("Model:"))
             top_row.Add(model_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
@@ -656,7 +1439,7 @@ class IssueDetailDialog(wx.Dialog):
 
             actions = wx.BoxSizer(wx.HORIZONTAL)
             if self._show_fix:
-                self.apply_fix_btn = wx.Button(self, label=_("Apply fix"))
+                self.apply_fix_btn = wx.Button(self, label=_("Apply fix and validate"))
                 self.apply_fix_btn.SetToolTip(
                     _(
                         "Write the proposed fix into the publication, "
@@ -702,6 +1485,7 @@ class IssueDetailDialog(wx.Dialog):
             self.explain_btn.Bind(wx.EVT_BUTTON, self._on_explain)
             if self._show_fix:
                 self.fix_btn.Bind(wx.EVT_BUTTON, self._on_fix)
+                self.fix_all_btn.Bind(wx.EVT_BUTTON, self._on_fix_all)
             self.ask_btn.Bind(wx.EVT_BUTTON, self._on_ask_followup)
             self.followup_ctrl.Bind(wx.EVT_TEXT_ENTER, self._on_ask_followup)
             self.view_browser_btn.Bind(wx.EVT_BUTTON, self._on_view_ai_browser)
@@ -747,6 +1531,7 @@ class IssueDetailDialog(wx.Dialog):
         self.explain_btn.Enable(False)
         if self._show_fix:
             self.fix_btn.Enable(False)
+            self.fix_all_btn.Enable(False)
         if hasattr(self, "ai_status"):
             self.ai_status.SetLabel(_("Loading AI view…"))
 
@@ -757,7 +1542,14 @@ class IssueDetailDialog(wx.Dialog):
 
             view.Bind(html2.EVT_WEBVIEW_NAVIGATING, self._on_ai_webview_navigating)
             view.Bind(html2.EVT_WEBVIEW_LOADED, self._on_ai_webview_loaded)
-            view.SetPage("<!DOCTYPE html><html><body></body></html>", "")
+            from .ai.markdown_html import ai_idle_placeholder_page
+
+            view.SetPage(
+                ai_idle_placeholder_page(title=_("AI explanation"), tab_exit=True),
+                "",
+            )
+        else:
+            view.ChangeValue(_("AI-generated responses will be shown here."))
 
         sizer = host.GetSizer()
         if sizer is not None:
@@ -769,14 +1561,27 @@ class IssueDetailDialog(wx.Dialog):
         _wire_ai_html_host(host, view, is_webview=is_webview)
         host.Layout()
         self.Layout()
-        # Edge document HWND appears asynchronously — refresh tab-stop shortly after.
+        # Edge recreates child HWNDs asynchronously — keep host as the Tab gate.
         if is_webview:
-            wx.CallLater(100, lambda v=view: _ensure_win_tab_stop(v))
-            wx.CallLater(300, lambda v=view: _ensure_win_tab_stop(v))
+            wx.CallLater(
+                100,
+                lambda h=host, v=view: _refresh_ai_html_tab_stops(
+                    h, v, is_webview=True
+                ),
+            )
+            wx.CallLater(
+                300,
+                lambda h=host, v=view: _refresh_ai_html_tab_stops(
+                    h, v, is_webview=True
+                ),
+            )
 
         self.explain_btn.Enable(not self._busy)
         if self._show_fix:
             self.fix_btn.Enable(not self._busy)
+            self.fix_all_btn.Enable(
+                (not self._busy) and self._matching_like_this > 1
+            )
         if hasattr(self, "ai_status") and not self._busy:
             if self.ai_status.GetLabel() == _("Loading AI view…"):
                 self.ai_status.SetLabel("")
@@ -797,14 +1602,41 @@ class IssueDetailDialog(wx.Dialog):
         event.Skip()
 
     def _on_close_dialog(self, event: wx.Event | None = None) -> None:
-        # Always allow closing, even while an explain request is in flight.
+        # Guard against SetEscapeId + CHAR_HOOK both firing: a second pass would
+        # see IsModal() False and Destroy() while ShowModal is still unwinding,
+        # which leaves the main frame disabled/frozen.
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        # Cancel deferred WebView focus/reveal/paint chains (follow-up SetPage
+        # + MoveFocus into Edge can otherwise keep the process alive after exit).
+        self._ai_focus_gen = int(getattr(self, "_ai_focus_gen", 0)) + 1
         if self._ai_cancel is not None:
             self._ai_cancel.set()
-        self._close_ai_progress()
+        # Do not reclaim focus onto this dialog after teardown.
+        self._close_ai_progress(reclaim_focus=False)
+        try:
+            # Pull Win32 focus out of the WebView2 document before destroy.
+            close_btn = self.FindWindowById(wx.ID_CLOSE)
+            if close_btn is not None:
+                _try_set_focus(close_btn)
+            elif _try_set_focus(self):
+                pass
+        except RuntimeError:
+            pass
         if self.IsModal():
             self.EndModal(wx.ID_CLOSE)
         else:
             self.Destroy()
+
+    def _ai_dialog_alive(self) -> bool:
+        """False while closing or after the dialog window is gone."""
+        if getattr(self, "_closing", False):
+            return False
+        try:
+            return bool(self)
+        except RuntimeError:
+            return False
 
     def _ai_model_display_text(self) -> str:
         from .fido_settings import selected_model_service_string
@@ -823,7 +1655,8 @@ class IssueDetailDialog(wx.Dialog):
     def _set_apply_fix_enabled(self, enabled: bool) -> None:
         if not self._show_fix:
             return
-        self.apply_fix_btn.Enable(enabled and self._fix_proposal is not None)
+        has_proposal = self._fix_proposal is not None or self._batch_proposal is not None
+        self.apply_fix_btn.Enable(enabled and has_proposal)
 
     def _set_ai_export_enabled(self, enabled: bool) -> None:
         if not self._show_ai:
@@ -854,6 +1687,15 @@ class IssueDetailDialog(wx.Dialog):
     def _on_ai_webview_navigating(self, event) -> None:
         """Open http(s)/mailto links externally; allow in-dialog SetPage loads."""
         url = (event.GetURL() or "").strip()
+        action = _webview_host_action(url)
+        if action == "close":
+            event.Veto()
+            wx.CallAfter(self._on_close_dialog)
+            return
+        if action in ("next", "prev"):
+            event.Veto()
+            wx.CallAfter(self._leave_ai_webview, action == "next")
+            return
         if url.startswith(("http://", "https://", "mailto:")):
             event.Veto()
             try:
@@ -863,48 +1705,171 @@ class IssueDetailDialog(wx.Dialog):
             return
         event.Skip()
 
+    def _leave_ai_webview(self, forward: bool) -> None:
+        """Move dialog focus out of the WebView after Tab-at-boundary / Ctrl+Tab."""
+        if forward:
+            if _try_set_focus(getattr(self, "followup_ctrl", None)):
+                return
+            if _try_set_focus(getattr(self, "ask_btn", None)):
+                return
+            close_btn = self.FindWindowById(wx.ID_CLOSE)
+            _try_set_focus(close_btn)
+            return
+        if _try_set_focus(getattr(self, "ai_model_ctrl", None)):
+            return
+        if self._show_fix and _try_set_focus(getattr(self, "fix_btn", None)):
+            return
+        _try_set_focus(getattr(self, "explain_btn", None))
+
     def _on_ai_webview_loaded(self, event) -> None:
         """After SetPage, move focus into the WebView for screen-reader review."""
         event.Skip()
+        if not self._ai_dialog_alive():
+            return
+        host = getattr(self, "_ai_output_host", None)
         try:
-            _ensure_win_tab_stop(self.ai_output)
+            if host is not None:
+                _refresh_ai_html_tab_stops(
+                    host, self.ai_output, is_webview=True
+                )
         except RuntimeError:
             pass
         if not self._ai_focus_after_load:
             return
         self._ai_focus_after_load = False
-        self._schedule_ai_output_focus()
+        if _markdown_has_latest_followup(getattr(self, "_ai_markdown", "") or ""):
+            self._schedule_reveal_latest_followup()
+        else:
+            self._schedule_ai_output_focus()
 
     def _ai_dialog_html(self, *, plain: bool = False) -> str:
         """HTML document for the in-dialog WebView (same styling as browser view)."""
         from .ai.markdown_html import markdown_to_browser_page
 
+        # Keep the <title> generic. Appending the Ace/EPUBCheck code (e.g.
+        # aria-required-children) makes Narrator/NVDA announce it as the
+        # document name, which sounds like a dialog accessibility error.
         title = _("AI explanation")
-        code = (self._issue.code or "").strip()
-        if code:
-            title = f"{title} — {code}"
         if plain:
             return markdown_to_browser_page(
-                self._ai_markdown or "", title=title, plain=True
+                self._ai_markdown or "",
+                title=title,
+                plain=True,
+                tab_exit=True,
             )
         return markdown_to_browser_page(
-            self._ai_markdown or "", title=title, plain=False
+            self._ai_markdown or "",
+            title=title,
+            plain=False,
+            tab_exit=True,
         )
 
-    def _focus_ai_output_now(self) -> None:
+    def _focus_ai_output_now(self) -> bool:
+        """Try once to put focus on the AI pane host (not the Edge document)."""
+        if not self._ai_dialog_alive():
+            return True
         if not self._show_ai or not getattr(self, "_ai_view_realized", False):
-            return
-        _focus_ai_html_view(
+            return True
+        try:
+            if not self:
+                return True
+        except RuntimeError:
+            return True
+        try:
+            self.Raise()
+        except RuntimeError:
+            return False
+        _win_force_foreground(self)
+        # Keep keyboard in wx on the host gate — diving into Edge after Explain
+        # often leaves focus limbo where Escape/Tab do nothing.
+        if self._ai_output_is_webview:
+            host = getattr(self, "_ai_output_host", None)
+            return _try_set_focus(host if host is not None else self.ai_output)
+        return _focus_ai_html_view(
             self.ai_output,
-            is_webview=bool(self._ai_output_is_webview),
+            is_webview=False,
+            retries=0,
         )
 
     def _schedule_ai_output_focus(self) -> None:
         """Focus the AI pane after progress UI teardown (and WebView load)."""
-        # ProgressDialog destroy often steals focus; defer past that.
-        wx.CallAfter(self._focus_ai_output_now)
-        wx.CallLater(120, self._focus_ai_output_now)
-        wx.CallLater(350, self._focus_ai_output_now)
+        # One coordinated retry chain — supersedes any previous schedule so we
+        # never stack parallel “wx webview” focus storms.
+        if not self._ai_dialog_alive():
+            return
+        self._ai_focus_gen = int(getattr(self, "_ai_focus_gen", 0)) + 1
+        gen = self._ai_focus_gen
+
+        def _attempt(remaining: int) -> None:
+            if not self._ai_dialog_alive():
+                return
+            if gen != getattr(self, "_ai_focus_gen", 0):
+                return
+            if self._focus_ai_output_now():
+                return
+            if remaining > 0:
+                wx.CallLater(200, lambda: _attempt(remaining - 1))
+
+        wx.CallAfter(lambda: _attempt(5))
+
+    def _schedule_reveal_latest_followup(self) -> None:
+        """After a follow-up, scroll/focus the newest question in the HTML view."""
+        if not self._ai_dialog_alive():
+            return
+        self._ai_focus_gen = int(getattr(self, "_ai_focus_gen", 0)) + 1
+        gen = self._ai_focus_gen
+
+        def _attempt(remaining: int) -> None:
+            if not self._ai_dialog_alive():
+                return
+            if gen != getattr(self, "_ai_focus_gen", 0):
+                return
+            if self._reveal_latest_followup_now():
+                return
+            if remaining > 0:
+                wx.CallLater(200, lambda: _attempt(remaining - 1))
+
+        wx.CallAfter(lambda: _attempt(5))
+
+    def _reveal_latest_followup_now(self) -> bool:
+        """Try once to put viewport + SR focus on the newest follow-up question."""
+        if not self._ai_dialog_alive():
+            return True
+        if not self._show_ai or not getattr(self, "_ai_view_realized", False):
+            return True
+        try:
+            if not self:
+                return True
+            self.Raise()
+        except RuntimeError:
+            return False
+        _win_force_foreground(self)
+        if self._ai_output_is_webview:
+            # Prefer JS scroll only — MoveFocus/synthetic click into Edge after
+            # follow-up has been linked to unclean app shutdown on Windows.
+            try:
+                _webview_run_script(
+                    self.ai_output, _WEBVIEW_REVEAL_LATEST_FOLLOWUP_JS
+                )
+            except Exception:
+                return False
+            return True
+        # TextCtrl fallback: jump near the latest "You asked" / question text.
+        view = self.ai_output
+        if hasattr(view, "SetInsertionPoint") and hasattr(view, "GetValue"):
+            try:
+                text = view.GetValue() or ""
+                # Jump near the latest follow-up separator when present.
+                idx = text.rfind("---")
+                if idx < 0:
+                    idx = 0
+                view.SetInsertionPoint(min(idx, len(text)))
+                view.ShowPosition(min(idx, len(text)))
+                view.SetFocus()
+            except RuntimeError:
+                return False
+            return True
+        return _try_set_focus(view)
 
     def _set_ai_content(
         self,
@@ -915,6 +1880,8 @@ class IssueDetailDialog(wx.Dialog):
     ) -> None:
         from .ai.markdown_html import with_ai_disclaimer
 
+        if getattr(self, "_closing", False):
+            return
         self._ai_plain = plain
         raw = markdown_text or ""
         self._ai_markdown = raw if plain else with_ai_disclaimer(raw)
@@ -925,14 +1892,22 @@ class IssueDetailDialog(wx.Dialog):
             # Focus once LOADED fires so NVDA/JAWS land in the document.
             self._ai_focus_after_load = bool(focus)
             self.ai_output.SetPage(self._ai_dialog_html(plain=plain), "")
-            if focus:
-                # Also schedule in case LOADED already fired synchronously.
-                self._schedule_ai_output_focus()
+            # If LOADED already ran synchronously it cleared the flag — schedule
+            # once as fallback. Do not also schedule while waiting for LOADED.
+            if focus and not self._ai_focus_after_load:
+                if _markdown_has_latest_followup(self._ai_markdown or ""):
+                    self._schedule_reveal_latest_followup()
+                else:
+                    self._schedule_ai_output_focus()
         else:
             self.ai_output.SetValue(self._ai_markdown)
-            self.ai_output.SetInsertionPoint(0)
-            if focus:
-                self._schedule_ai_output_focus()
+            if _markdown_has_latest_followup(self._ai_markdown or ""):
+                if focus:
+                    self._schedule_reveal_latest_followup()
+            else:
+                self.ai_output.SetInsertionPoint(0)
+                if focus:
+                    self._schedule_ai_output_focus()
         self._set_ai_export_enabled(self._has_ai_content())
 
     def _on_view_ai_browser(self, _event: wx.Event) -> None:
@@ -1045,6 +2020,7 @@ class IssueDetailDialog(wx.Dialog):
         self.explain_btn.Enable(not busy)
         if self._show_fix:
             self.fix_btn.Enable(not busy)
+            self.fix_all_btn.Enable((not busy) and self._matching_like_this > 1)
             self._set_apply_fix_enabled(not busy)
         self.ask_btn.Enable(not busy and self._session is not None)
         self.followup_ctrl.Enable(not busy)
@@ -1069,8 +2045,17 @@ class IssueDetailDialog(wx.Dialog):
 
         wx.CallAfter(update)
 
+    def _present_ai_progress(self, message: str) -> None:
+        """Paint the progress dialog and give it focus for screen readers."""
+        dlg = self._ai_progress
+        if dlg is None:
+            return
+        _present_progress_dialog(dlg, message)
+
     def _open_ai_progress(self, title: str, message: str) -> threading.Event:
-        self._close_ai_progress()
+        # Closing a previous dialog must not reclaim parent focus — that steals
+        # activation from the new progress window before screen readers hear it.
+        self._close_ai_progress(reclaim_focus=False)
         cancel = threading.Event()
         self._ai_cancel = cancel
         self._ai_progress = wx.ProgressDialog(
@@ -1080,6 +2065,7 @@ class IssueDetailDialog(wx.Dialog):
             parent=self,
             style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT,
         )
+        self._present_ai_progress(message)
         self._ai_progress_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_ai_progress_timer, self._ai_progress_timer)
         self._ai_progress_timer.Start(200)
@@ -1100,12 +2086,18 @@ class IssueDetailDialog(wx.Dialog):
                 dlg.Pulse(_("Cancelling…"))
             except RuntimeError:
                 pass
-            self._close_ai_progress()
+            self._close_ai_progress(reclaim_focus=True)
             self._set_busy(False)
             if self._show_ai:
                 self.ai_status.SetLabel(_("Cancelled."))
 
-    def _close_ai_progress(self) -> None:
+    def _close_ai_progress(self, *, reclaim_focus: bool = True) -> None:
+        # Bump generation so a deferred reclaim from an older close cannot steal
+        # focus from a newly opened progress dialog.
+        self._ai_progress_reclaim_gen = (
+            int(getattr(self, "_ai_progress_reclaim_gen", 0)) + 1
+        )
+        reclaim_gen = self._ai_progress_reclaim_gen
         timer = self._ai_progress_timer
         if timer is not None:
             try:
@@ -1121,25 +2113,63 @@ class IssueDetailDialog(wx.Dialog):
                 dlg.Destroy()
             except RuntimeError:
                 pass
+            if not reclaim_focus:
+                return
+            # Modal progress teardown often leaves no foreground window; reclaim
+            # activation for this dialog so later SetFocus into the WebView sticks.
+            def _reclaim() -> None:
+                if reclaim_gen != getattr(self, "_ai_progress_reclaim_gen", 0):
+                    return
+                if getattr(self, "_ai_progress", None) is not None:
+                    return
+                try:
+                    if not self:
+                        return
+                    self.Raise()
+                    _win_force_foreground(self)
+                except RuntimeError:
+                    return
+
+            wx.CallAfter(_reclaim)
+            wx.CallLater(100, _reclaim)
+
+    def _fail_ai_libraries(self, detail: str) -> None:
+        """UI-thread handler when LiteLLM preload fails in a worker."""
+        self._close_ai_progress(reclaim_focus=True)
+        self._set_busy(False)
+        from .ai.explain import error_message_for_key
+
+        msg = error_message_for_key("no_litellm", detail=detail)
+        if hasattr(self, "ai_status"):
+            self.ai_status.SetLabel(_("Could not load AI libraries."))
+        wx.MessageBox(msg, _("Error"), wx.OK | wx.ICON_ERROR, self)
 
     def _on_explain(self, _event: wx.Event) -> None:
         if self._busy:
             return
         self._fix_proposal = None
+        self._batch_proposal = None
         self._set_apply_fix_enabled(False)
         cancel = self._open_ai_progress(
             _("Explain with AI"), _("Loading AI libraries…")
         )
         self._set_busy(True, _("Loading AI libraries…"))
-        if not self._preload_ai_libraries():
-            return
         issue = self._issue
         result = self._check_result
         status_cb = self._ai_status_callback
 
         def work() -> None:
             from .ai.explain import ExplainResult, explain_issue
+            from .ai.litellm_client import preload_litellm
 
+            # Keep preload off the UI thread so the progress dialog can paint,
+            # pulse, and be announced by screen readers.
+            ok, detail = preload_litellm()
+            if not ok:
+                wx.CallAfter(self._fail_ai_libraries, detail)
+                return
+            if cancel.is_set():
+                return
             try:
                 out = explain_issue(
                     issue,
@@ -1159,41 +2189,76 @@ class IssueDetailDialog(wx.Dialog):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _preload_ai_libraries(self) -> bool:
-        """Import LiteLLM on the UI thread before starting a worker."""
-        from .ai.litellm_client import preload_litellm
-
-        ok, detail = preload_litellm()
-        if ok:
-            return True
-        self._close_ai_progress()
-        self._set_busy(False)
-        from .ai.explain import error_message_for_key
-
-        msg = error_message_for_key("no_litellm", detail=detail)
-        if hasattr(self, "ai_status"):
-            self.ai_status.SetLabel(_("Could not load AI libraries."))
-        wx.MessageBox(msg, _("Error"), wx.OK | wx.ICON_ERROR, self)
-        return False
-
     def _on_fix(self, _event: wx.Event) -> None:
         if self._busy or not self._show_fix:
             return
         self._fix_proposal = None
+        self._batch_proposal = None
         self._set_apply_fix_enabled(False)
-        cancel = self._open_ai_progress(_("Fix with AI"), _("Loading AI libraries…"))
+        cancel = self._open_ai_progress(
+            _("Suggest fix with AI"), _("Loading AI libraries…")
+        )
         self._set_busy(True, _("Loading AI libraries…"))
-        if not self._preload_ai_libraries():
-            return
         issue = self._issue
         result = self._check_result
         status_cb = self._ai_status_callback
 
         def work() -> None:
             from .ai.fix import FixResult, propose_fix
+            from .ai.litellm_client import preload_litellm
 
+            ok, detail = preload_litellm()
+            if not ok:
+                wx.CallAfter(self._fail_ai_libraries, detail)
+                return
+            if cancel.is_set():
+                return
             try:
                 out = propose_fix(
+                    issue,
+                    result,
+                    cancel_event=cancel,
+                    status_callback=status_cb,
+                )
+            except Exception as exc:
+                out = FixResult(ok=False, error_key="provider_error", text=str(exc))
+            if cancel.is_set():
+                return
+            try:
+                wx.PostEvent(self, FixAiEvent(result=out))
+            except RuntimeError:
+                return
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_fix_all(self, _event: wx.Event) -> None:
+        if self._busy or not self._show_fix:
+            return
+        if self._matching_like_this <= 1:
+            return
+        self._fix_proposal = None
+        self._batch_proposal = None
+        self._set_apply_fix_enabled(False)
+        cancel = self._open_ai_progress(
+            _("Suggest all like this…"), _("Loading AI libraries…")
+        )
+        self._set_busy(True, _("Loading AI libraries…"))
+        issue = self._issue
+        result = self._check_result
+        status_cb = self._ai_status_callback
+
+        def work() -> None:
+            from .ai.fix import FixResult, propose_batch_fix
+            from .ai.litellm_client import preload_litellm
+
+            ok, detail = preload_litellm()
+            if not ok:
+                wx.CallAfter(self._fail_ai_libraries, detail)
+                return
+            if cancel.is_set():
+                return
+            try:
+                out = propose_batch_fix(
                     issue,
                     result,
                     cancel_event=cancel,
@@ -1218,20 +2283,29 @@ class IssueDetailDialog(wx.Dialog):
             return
         cancel = self._open_ai_progress(_("Follow-up"), _("Loading AI libraries…"))
         self._set_busy(True, _("Loading AI libraries…"))
-        if not self._preload_ai_libraries():
-            return
-        self._set_busy(True, _("Thinking…"))
-        if self._ai_progress is not None:
-            try:
-                self._ai_progress.Pulse(_("Thinking…"))
-            except RuntimeError:
-                pass
         session = self._session
         status_cb = self._ai_status_callback
 
         def work() -> None:
             from .ai.explain import ExplainResult, ask_followup
+            from .ai.litellm_client import preload_litellm
 
+            ok, detail = preload_litellm()
+            if not ok:
+                wx.CallAfter(self._fail_ai_libraries, detail)
+                return
+            if cancel.is_set():
+                return
+
+            def _thinking() -> None:
+                if self._ai_progress is not None:
+                    try:
+                        self._ai_progress.Pulse(_("Thinking…"))
+                    except RuntimeError:
+                        pass
+                self._set_busy(True, _("Thinking…"))
+
+            wx.CallAfter(_thinking)
             try:
                 out = ask_followup(
                     session,
@@ -1246,7 +2320,9 @@ class IssueDetailDialog(wx.Dialog):
                     text=str(exc),
                     session=session,
                 )
-            if cancel.is_set():
+            # Prefer showing a completed reply over a late cancel race with the
+            # progress dialog (Pulse can flip to cancelled while the reply lands).
+            if cancel.is_set() and not (out.ok and (out.text or "").strip()):
                 return
             try:
                 wx.PostEvent(
@@ -1289,10 +2365,53 @@ class IssueDetailDialog(wx.Dialog):
                 question=question,
                 answer=result.text or "",
             )
-            self._set_ai_content(self._ai_markdown, focus=True)
-            self.followup_ctrl.SetValue("")
-        else:
-            self._set_ai_content(result.text or "", focus=True)
+            # Defer SetPage until after ProgressDialog teardown / Layout so Edge
+            # WebView2 reliably paints the updated document (follow-ups were
+            # landing in markdown but staying off-screen or unpainted).
+            md = self._ai_markdown
+
+            def _paint_followup() -> None:
+                if not self._ai_dialog_alive():
+                    return
+                try:
+                    if not self:
+                        return
+                except RuntimeError:
+                    return
+                # Paint without diving Win32 focus into Edge (see close hang).
+                self._set_ai_content(md, focus=False)
+                self.followup_ctrl.SetValue("")
+                self.ai_status.SetLabel(_("Done"))
+                # Scroll in-document via page script / one JS pass only.
+                if self._ai_output_is_webview and _markdown_has_latest_followup(md):
+                    wx.CallLater(
+                        120,
+                        lambda: self._ai_dialog_alive()
+                        and _webview_run_script(
+                            self.ai_output, _WEBVIEW_REVEAL_LATEST_FOLLOWUP_JS
+                        ),
+                    )
+                try:
+                    _try_set_focus(self.followup_ctrl)
+                except RuntimeError:
+                    pass
+
+            wx.CallAfter(_paint_followup)
+            try:
+                from .telemetry import log_ai_explain
+
+                log_ai_explain(followup=True)
+            except Exception:
+                pass
+            return
+
+        self._set_ai_content(result.text or "", focus=True)
+        try:
+            from .telemetry import log_ai_explain
+
+            log_ai_explain(followup=False)
+        except Exception:
+            pass
         self.ai_status.SetLabel(_("Done"))
 
     def _on_fix_ai_event(self, event: FixAiEvent) -> None:
@@ -1308,6 +2427,7 @@ class IssueDetailDialog(wx.Dialog):
                 return
             msg = error_message_for_key(result.error_key, detail=result.text or "")
             self._fix_proposal = None
+            self._batch_proposal = None
             self._set_apply_fix_enabled(False)
             self._set_ai_content(msg, plain=True, focus=True)
             self.ai_status.SetLabel(_("Could not propose a fix."))
@@ -1319,16 +2439,35 @@ class IssueDetailDialog(wx.Dialog):
         self._session = result.session
         self.ask_btn.Enable(True)
         self._fix_proposal = result.proposal
+        self._batch_proposal = result.batch
         self._set_ai_content(result.text or "", focus=True)
-        if result.proposal is None:
+        try:
+            from .telemetry import log_ai_fix
+
+            log_ai_fix(applied=False)
+        except Exception:
+            pass
+        if result.proposal is None and result.batch is None:
             self._set_apply_fix_enabled(False)
             self.ai_status.SetLabel(_("Done"))
         else:
             self._set_apply_fix_enabled(True)
-            self.ai_status.SetLabel(_("Fix proposed. Review, then Apply fix."))
+            if result.batch is not None:
+                self.ai_status.SetLabel(
+                    _(
+                        "Batch fix suggested ({n} patch(es)). Review, then "
+                        "Apply fix and validate."
+                    ).format(n=len(result.batch.patches))
+                )
+            else:
+                self.ai_status.SetLabel(
+                    _("Fix suggested. Review, then Apply fix and validate.")
+                )
 
     def _on_apply_fix(self, _event: wx.Event) -> None:
-        if self._busy or not self._show_fix or self._fix_proposal is None:
+        if self._busy or not self._show_fix:
+            return
+        if self._fix_proposal is None and self._batch_proposal is None:
             return
         target = ""
         if self._check_result and self._check_result.target_path:
@@ -1344,12 +2483,16 @@ class IssueDetailDialog(wx.Dialog):
 
         self._set_busy(True, _("Applying fix…"))
         proposal = self._fix_proposal
+        batch = self._batch_proposal
 
         def work() -> None:
-            from .ai.fix import apply_proposed_fix
+            from .ai.fix import apply_proposed_fix, apply_proposed_fixes
 
             try:
-                out = apply_proposed_fix(proposal, target)
+                if batch is not None:
+                    out = apply_proposed_fixes(batch.patches, target)
+                else:
+                    out = apply_proposed_fix(proposal, target)
             except Exception as exc:
                 from .epub_package import ApplyResult
 
@@ -1362,7 +2505,7 @@ class IssueDetailDialog(wx.Dialog):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_apply_fix_event(self, event: ApplyFixEvent) -> None:
-        from .ai.fix import PendingFixVerify, error_message_for_key
+        from .ai.fix import PendingFixVerify, error_message_for_key, parse_extra_backups
         from .epub_package import restore_path_for_apply
 
         result = event.result
@@ -1374,19 +2517,92 @@ class IssueDetailDialog(wx.Dialog):
             self._set_apply_fix_enabled(True)
             return
 
+        proposal = self._fix_proposal
+        batch = self._batch_proposal
         self._fix_proposal = None
+        self._batch_proposal = None
         self._set_apply_fix_enabled(False)
+        try:
+            from .telemetry import log_ai_fix
+
+            log_ai_fix(applied=True)
+        except Exception:
+            pass
         target = ""
         if self._check_result and self._check_result.target_path:
             target = self._check_result.target_path
+        changelog_path = ""
+        extra_backups = parse_extra_backups(result.detail or "")
         if target and result.backup_path and self._check_result is not None:
-            self.applied_fix_verify = PendingFixVerify(
-                issue=self._issue,
-                target_path=target,
-                backup_path=result.backup_path,
-                restore_to=restore_path_for_apply(target, result),
-                before_result=self._check_result,
-            )
+            if batch is not None:
+                rationale = batch.rationale
+                member = result.member or (
+                    batch.patches[0].file if batch.patches else ""
+                )
+                try:
+                    from .edit_log import log_batch_fix_applied
+
+                    log_file = log_batch_fix_applied(
+                        target_path=target,
+                        issue=self._issue,
+                        backup_path=result.backup_path,
+                        patches=[
+                            (p.file, p.original, p.replacement) for p in batch.patches
+                        ],
+                        rationale=rationale,
+                        matched_issue_count=batch.matched_issue_count
+                        or self._matching_like_this,
+                        extra_backups=extra_backups,
+                    )
+                    changelog_path = str(log_file)
+                except OSError:
+                    changelog_path = ""
+                self.applied_fix_verify = PendingFixVerify(
+                    issue=self._issue,
+                    target_path=target,
+                    backup_path=result.backup_path,
+                    restore_to=restore_path_for_apply(target, result),
+                    before_result=self._check_result,
+                    member=member,
+                    rationale=rationale,
+                    changelog_path=changelog_path,
+                    batch_mode=True,
+                    patch_count=len(batch.patches),
+                    matched_before=batch.matched_issue_count or self._matching_like_this,
+                    extra_backups=extra_backups,
+                )
+            else:
+                member = result.member or (proposal.file if proposal else "")
+                rationale = proposal.rationale if proposal else ""
+                original = proposal.original if proposal else ""
+                replacement = proposal.replacement if proposal else ""
+                try:
+                    from .edit_log import log_fix_applied
+
+                    log_file = log_fix_applied(
+                        target_path=target,
+                        issue=self._issue,
+                        member=member,
+                        backup_path=result.backup_path,
+                        rationale=rationale,
+                        original=original,
+                        replacement=replacement,
+                    )
+                    changelog_path = str(log_file)
+                except OSError:
+                    changelog_path = ""
+                self.applied_fix_verify = PendingFixVerify(
+                    issue=self._issue,
+                    target_path=target,
+                    backup_path=result.backup_path,
+                    restore_to=restore_path_for_apply(target, result),
+                    before_result=self._check_result,
+                    member=member,
+                    rationale=rationale,
+                    original=original,
+                    replacement=replacement,
+                    changelog_path=changelog_path,
+                )
         else:
             self.applied_fix_verify = None
         # Close and let the main window re-check (verify / optional revert after).
@@ -1405,6 +2621,7 @@ class AiOverviewDialog(wx.Dialog):
         *,
         markdown_text: str,
         result: CheckResult,
+        session=None,
     ) -> None:
         super().__init__(
             parent,
@@ -1413,6 +2630,11 @@ class AiOverviewDialog(wx.Dialog):
         )
         self.SetSize((720, 640))
         self._result = result
+        self._session = session
+        self._busy = False
+        self._ai_cancel: threading.Event | None = None
+        self._ai_progress: wx.ProgressDialog | None = None
+        self._ai_progress_timer: wx.Timer | None = None
         self._ai_plain = False
         self._ai_output_is_webview = False
         self._ai_focus_after_load = False
@@ -1446,6 +2668,21 @@ class AiOverviewDialog(wx.Dialog):
         self.ai_output = self._ai_output_host
         root.Add(self._ai_output_host, 1, wx.EXPAND | wx.ALL, 12)
 
+        follow_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.followup_ctrl = wx.TextCtrl(
+            self,
+            value="",
+            style=wx.TE_PROCESS_ENTER,
+            name=_("Follow-up question"),
+        )
+        if hasattr(self.followup_ctrl, "SetHint"):
+            self.followup_ctrl.SetHint(_("Ask a follow-up question…"))
+        self.ask_btn = wx.Button(self, label=_("Ask"))
+        self.ask_btn.Enable(self._session is not None)
+        follow_row.Add(self.followup_ctrl, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        follow_row.Add(self.ask_btn, 0)
+        root.Add(follow_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+
         actions = wx.BoxSizer(wx.HORIZONTAL)
         self.view_browser_btn = wx.Button(self, label=_("View in browser"))
         self.save_html_btn = wx.Button(self, label=_("Save as HTML…"))
@@ -1467,17 +2704,27 @@ class AiOverviewDialog(wx.Dialog):
         footer.Add(close_btn, 0)
         root.Add(footer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
 
+        self.ask_btn.Bind(wx.EVT_BUTTON, self._on_ask_followup)
+        self.followup_ctrl.Bind(wx.EVT_TEXT_ENTER, self._on_ask_followup)
         self.view_browser_btn.Bind(wx.EVT_BUTTON, self._on_view_browser)
         self.save_html_btn.Bind(wx.EVT_BUTTON, self._on_save_html)
         self.save_md_btn.Bind(wx.EVT_BUTTON, self._on_save_markdown)
         self.copy_ai_btn.Bind(wx.EVT_BUTTON, self._on_copy_clipboard)
+        self.Bind(EVT_EXPLAIN_AI, self._on_followup_ai_event)
 
         self.SetSizer(root)
         self.CentreOnParent()
         self.SetEscapeId(wx.ID_CLOSE)
         self.SetAffirmativeId(wx.ID_CLOSE)
         self.Bind(wx.EVT_CLOSE, self._on_close_dialog)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_dialog_char_hook)
         close_btn.SetDefault()
+
+    def _on_dialog_char_hook(self, event: wx.KeyEvent) -> None:
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self._on_close_dialog(event)
+            return
+        event.Skip()
 
     def _realize_ai_html_view(self) -> None:
         if getattr(self, "_ai_view_realized", False):
@@ -1492,7 +2739,14 @@ class AiOverviewDialog(wx.Dialog):
 
             view.Bind(html2.EVT_WEBVIEW_NAVIGATING, self._on_webview_navigating)
             view.Bind(html2.EVT_WEBVIEW_LOADED, self._on_webview_loaded)
-            view.SetPage("<!DOCTYPE html><html><body></body></html>", "")
+            from .ai.markdown_html import ai_idle_placeholder_page
+
+            view.SetPage(
+                ai_idle_placeholder_page(title=_("AI overview"), tab_exit=True),
+                "",
+            )
+        else:
+            view.ChangeValue(_("AI-generated responses will be shown here."))
         sizer = host.GetSizer()
         if sizer is not None:
             sizer.Clear(delete_windows=True)
@@ -1504,12 +2758,31 @@ class AiOverviewDialog(wx.Dialog):
         host.Layout()
         self.Layout()
         if is_webview:
-            wx.CallLater(100, lambda v=view: _ensure_win_tab_stop(v))
-            wx.CallLater(300, lambda v=view: _ensure_win_tab_stop(v))
+            wx.CallLater(
+                100,
+                lambda h=host, v=view: _refresh_ai_html_tab_stops(
+                    h, v, is_webview=True
+                ),
+            )
+            wx.CallLater(
+                300,
+                lambda h=host, v=view: _refresh_ai_html_tab_stops(
+                    h, v, is_webview=True
+                ),
+            )
         self._paint_content(focus=True)
 
     def _on_webview_navigating(self, event) -> None:
         url = (event.GetURL() or "").strip()
+        action = _webview_host_action(url)
+        if action == "close":
+            event.Veto()
+            wx.CallAfter(self._on_close_dialog)
+            return
+        if action in ("next", "prev"):
+            event.Veto()
+            wx.CallAfter(self._leave_ai_webview, action == "next")
+            return
         if url.startswith(("http://", "https://", "mailto:")):
             event.Veto()
             try:
@@ -1519,45 +2792,385 @@ class AiOverviewDialog(wx.Dialog):
             return
         event.Skip()
 
+    def _leave_ai_webview(self, forward: bool) -> None:
+        if forward:
+            if _try_set_focus(getattr(self, "followup_ctrl", None)):
+                return
+            if _try_set_focus(getattr(self, "ask_btn", None)):
+                return
+            if _try_set_focus(getattr(self, "view_browser_btn", None)):
+                return
+            close_btn = self.FindWindowById(wx.ID_CLOSE)
+            _try_set_focus(close_btn)
+            return
+        close_btn = self.FindWindowById(wx.ID_CLOSE)
+        _try_set_focus(close_btn)
+
     def _on_webview_loaded(self, event) -> None:
         event.Skip()
+        if not self._ai_dialog_alive():
+            return
+        host = getattr(self, "_ai_output_host", None)
         try:
-            _ensure_win_tab_stop(self.ai_output)
+            if host is not None:
+                _refresh_ai_html_tab_stops(
+                    host, self.ai_output, is_webview=True
+                )
         except RuntimeError:
             pass
         if not self._ai_focus_after_load:
             return
         self._ai_focus_after_load = False
-        wx.CallAfter(self._focus_output)
-        wx.CallLater(120, self._focus_output)
-        wx.CallLater(350, self._focus_output)
+        if _markdown_has_latest_followup(getattr(self, "_ai_markdown", "") or ""):
+            self._schedule_reveal_latest_followup()
+        else:
+            self._schedule_output_focus()
 
-    def _focus_output(self) -> None:
-        _focus_ai_html_view(
+    def _schedule_output_focus(self) -> None:
+        if not self._ai_dialog_alive():
+            return
+        self._ai_focus_gen = int(getattr(self, "_ai_focus_gen", 0)) + 1
+        gen = self._ai_focus_gen
+
+        def _attempt(remaining: int) -> None:
+            if not self._ai_dialog_alive():
+                return
+            if gen != getattr(self, "_ai_focus_gen", 0):
+                return
+            if self._focus_output():
+                return
+            if remaining > 0:
+                wx.CallLater(200, lambda: _attempt(remaining - 1))
+
+        wx.CallAfter(lambda: _attempt(5))
+
+    def _schedule_reveal_latest_followup(self) -> None:
+        if not self._ai_dialog_alive():
+            return
+        self._ai_focus_gen = int(getattr(self, "_ai_focus_gen", 0)) + 1
+        gen = self._ai_focus_gen
+
+        def _attempt(remaining: int) -> None:
+            if not self._ai_dialog_alive():
+                return
+            if gen != getattr(self, "_ai_focus_gen", 0):
+                return
+            if self._reveal_latest_followup_now():
+                return
+            if remaining > 0:
+                wx.CallLater(200, lambda: _attempt(remaining - 1))
+
+        wx.CallAfter(lambda: _attempt(5))
+
+    def _reveal_latest_followup_now(self) -> bool:
+        if not self._ai_dialog_alive():
+            return True
+        try:
+            if not self:
+                return True
+            self.Raise()
+        except RuntimeError:
+            return False
+        _win_force_foreground(self)
+        if self._ai_output_is_webview:
+            try:
+                _webview_run_script(
+                    self.ai_output, _WEBVIEW_REVEAL_LATEST_FOLLOWUP_JS
+                )
+            except Exception:
+                return False
+            return True
+        view = self.ai_output
+        if hasattr(view, "SetInsertionPoint") and hasattr(view, "GetValue"):
+            try:
+                text = view.GetValue() or ""
+                idx = text.rfind("---")
+                if idx < 0:
+                    idx = 0
+                view.SetInsertionPoint(min(idx, len(text)))
+                view.ShowPosition(min(idx, len(text)))
+                view.SetFocus()
+            except RuntimeError:
+                return False
+            return True
+        return _try_set_focus(view)
+
+    def _focus_output(self) -> bool:
+        if not self._ai_dialog_alive():
+            return True
+        try:
+            if not self:
+                return True
+            self.Raise()
+        except RuntimeError:
+            return False
+        _win_force_foreground(self)
+        if self._ai_output_is_webview:
+            host = getattr(self, "_ai_output_host", None)
+            return _try_set_focus(host if host is not None else self.ai_output)
+        return _focus_ai_html_view(
             self.ai_output,
-            is_webview=bool(self._ai_output_is_webview),
+            is_webview=False,
+            retries=0,
         )
 
     def _dialog_html(self) -> str:
         from .ai.markdown_html import markdown_to_browser_page
 
         return markdown_to_browser_page(
-            self._ai_markdown or "", title=_("AI overview"), plain=self._ai_plain
+            self._ai_markdown or "",
+            title=_("AI overview"),
+            plain=self._ai_plain,
+            tab_exit=True,
         )
 
     def _paint_content(self, *, focus: bool = False) -> None:
+        if not self._ai_dialog_alive():
+            return
         if not self._ai_view_realized:
             return
         if self._ai_output_is_webview:
             self._ai_focus_after_load = bool(focus)
             self.ai_output.SetPage(self._dialog_html(), "")
-            if focus:
-                wx.CallAfter(self._focus_output)
-                wx.CallLater(120, self._focus_output)
+            if focus and not self._ai_focus_after_load:
+                if _markdown_has_latest_followup(self._ai_markdown or ""):
+                    self._schedule_reveal_latest_followup()
+                else:
+                    self._schedule_output_focus()
         else:
             self.ai_output.SetValue(self._ai_markdown or "")
-            if focus:
-                self._focus_output()
+            if _markdown_has_latest_followup(self._ai_markdown or ""):
+                if focus:
+                    self._schedule_reveal_latest_followup()
+            elif focus:
+                self._schedule_output_focus()
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self.ask_btn.Enable(not busy and self._session is not None)
+        self.followup_ctrl.Enable(not busy)
+        for btn in (
+            self.view_browser_btn,
+            self.save_html_btn,
+            self.save_md_btn,
+            self.copy_ai_btn,
+        ):
+            btn.Enable(not busy and bool((self._ai_markdown or "").strip()))
+
+    def _ai_status_callback(self, message: str) -> None:
+        def update() -> None:
+            if self._ai_progress is not None:
+                try:
+                    cont, _skip = self._ai_progress.Pulse(message)
+                    if not cont and self._ai_cancel is not None:
+                        self._ai_cancel.set()
+                except RuntimeError:
+                    pass
+
+        wx.CallAfter(update)
+
+    def _present_ai_progress(self, message: str) -> None:
+        dlg = self._ai_progress
+        if dlg is None:
+            return
+        _present_progress_dialog(dlg, message)
+
+    def _open_ai_progress(self, title: str, message: str) -> threading.Event:
+        self._close_ai_progress(reclaim_focus=False)
+        cancel = threading.Event()
+        self._ai_cancel = cancel
+        self._ai_progress = wx.ProgressDialog(
+            title,
+            message,
+            maximum=100,
+            parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT,
+        )
+        self._present_ai_progress(message)
+        self._ai_progress_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_ai_progress_timer, self._ai_progress_timer)
+        self._ai_progress_timer.Start(200)
+        return cancel
+
+    def _on_ai_progress_timer(self, _event: wx.TimerEvent) -> None:
+        dlg = self._ai_progress
+        cancel = self._ai_cancel
+        if dlg is None or cancel is None:
+            return
+        try:
+            cont, _skip = dlg.Pulse()
+        except RuntimeError:
+            return
+        if not cont:
+            cancel.set()
+            try:
+                dlg.Pulse(_("Cancelling…"))
+            except RuntimeError:
+                pass
+            self._close_ai_progress(reclaim_focus=True)
+            self._set_busy(False)
+
+    def _close_ai_progress(self, *, reclaim_focus: bool = True) -> None:
+        self._ai_progress_reclaim_gen = (
+            int(getattr(self, "_ai_progress_reclaim_gen", 0)) + 1
+        )
+        reclaim_gen = self._ai_progress_reclaim_gen
+        timer = self._ai_progress_timer
+        if timer is not None:
+            try:
+                if timer.IsRunning():
+                    timer.Stop()
+            except RuntimeError:
+                pass
+            self._ai_progress_timer = None
+        dlg = self._ai_progress
+        self._ai_progress = None
+        if dlg is not None:
+            try:
+                dlg.Destroy()
+            except RuntimeError:
+                pass
+            if not reclaim_focus:
+                return
+
+            def _reclaim() -> None:
+                if reclaim_gen != getattr(self, "_ai_progress_reclaim_gen", 0):
+                    return
+                try:
+                    if not self:
+                        return
+                    self.Raise()
+                    _win_force_foreground(self)
+                except RuntimeError:
+                    return
+
+            wx.CallLater(50, _reclaim)
+
+    def _fail_ai_libraries(self, detail: str = "") -> None:
+        self._close_ai_progress()
+        self._set_busy(False)
+        from .ai.explain import error_message_for_key
+
+        msg = error_message_for_key("no_litellm", detail=detail or "")
+        wx.MessageBox(msg, _("AI overview"), wx.OK | wx.ICON_ERROR, self)
+
+    def _on_ask_followup(self, _event: wx.Event) -> None:
+        if self._busy or self._session is None:
+            return
+        question = self.followup_ctrl.GetValue().strip()
+        if not question:
+            return
+        cancel = self._open_ai_progress(_("Follow-up"), _("Loading AI libraries…"))
+        self._set_busy(True)
+        session = self._session
+        status_cb = self._ai_status_callback
+
+        def work() -> None:
+            from .ai.explain import ExplainResult
+            from .ai.litellm_client import preload_litellm
+            from .ai.overview import ask_overview_followup
+
+            ok, detail = preload_litellm()
+            if not ok:
+                wx.CallAfter(self._fail_ai_libraries, detail)
+                return
+            if cancel.is_set():
+                return
+
+            def _thinking() -> None:
+                if self._ai_progress is not None:
+                    try:
+                        self._ai_progress.Pulse(_("Thinking…"))
+                    except RuntimeError:
+                        pass
+
+            wx.CallAfter(_thinking)
+            try:
+                out = ask_overview_followup(
+                    session,
+                    question,
+                    cancel_event=cancel,
+                    status_callback=status_cb,
+                )
+            except Exception as exc:
+                out = ExplainResult(
+                    ok=False,
+                    error_key="provider_error",
+                    text=str(exc),
+                    session=session,
+                )
+            if cancel.is_set() and not (out.ok and (out.text or "").strip()):
+                return
+            try:
+                wx.PostEvent(
+                    self,
+                    ExplainAiEvent(kind="followup", result=out, question=question),
+                )
+            except RuntimeError:
+                return
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_followup_ai_event(self, event: ExplainAiEvent) -> None:
+        from .ai.explain import error_message_for_key
+        from .ai.markdown_html import append_followup_markdown
+
+        result = event.result
+        self._close_ai_progress()
+        self._set_busy(False)
+        if not result.ok:
+            if result.error_key == "cancelled":
+                return
+            msg = error_message_for_key(result.error_key, detail=result.text or "")
+            wx.MessageBox(msg, _("AI overview"), wx.OK | wx.ICON_ERROR, self)
+            if result.session is not None:
+                self._session = result.session
+                self.ask_btn.Enable(True)
+            return
+
+        self._session = result.session
+        self.ask_btn.Enable(True)
+        question = getattr(event, "question", "") or ""
+        self._ai_markdown = append_followup_markdown(
+            self._ai_markdown,
+            heading=_("Follow-up"),
+            question=question,
+            answer=result.text or "",
+        )
+        self._ai_plain = False
+
+        def _paint_followup() -> None:
+            if not self._ai_dialog_alive():
+                return
+            try:
+                if not self:
+                    return
+            except RuntimeError:
+                return
+            self._paint_content(focus=False)
+            self.followup_ctrl.SetValue("")
+            if self._ai_output_is_webview and _markdown_has_latest_followup(
+                self._ai_markdown or ""
+            ):
+                wx.CallLater(
+                    120,
+                    lambda: self._ai_dialog_alive()
+                    and _webview_run_script(
+                        self.ai_output, _WEBVIEW_REVEAL_LATEST_FOLLOWUP_JS
+                    ),
+                )
+            try:
+                _try_set_focus(self.followup_ctrl)
+            except RuntimeError:
+                pass
+
+        wx.CallAfter(_paint_followup)
+        try:
+            from .telemetry import log_ai_overview
+
+            log_ai_overview(followup=True)
+        except Exception:
+            pass
 
     def _export_markdown(self) -> str:
         from .ai.markdown_html import with_ai_disclaimer
@@ -1643,10 +3256,33 @@ class AiOverviewDialog(wx.Dialog):
                 wx.TheClipboard.Close()
 
     def _on_close_dialog(self, event: wx.Event | None = None) -> None:
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        self._ai_focus_gen = int(getattr(self, "_ai_focus_gen", 0)) + 1
+        if self._ai_cancel is not None:
+            self._ai_cancel.set()
+        self._close_ai_progress(reclaim_focus=False)
+        try:
+            close_btn = self.FindWindowById(wx.ID_CLOSE)
+            if close_btn is not None:
+                _try_set_focus(close_btn)
+            else:
+                _try_set_focus(self)
+        except RuntimeError:
+            pass
         if self.IsModal():
             self.EndModal(wx.ID_CLOSE)
         else:
             self.Destroy()
+
+    def _ai_dialog_alive(self) -> bool:
+        if getattr(self, "_closing", False):
+            return False
+        try:
+            return bool(self)
+        except RuntimeError:
+            return False
 
 
 class AboutDialog(wx.Dialog):
@@ -1756,6 +3392,9 @@ class EBrailleApp(wx.App):
         super().__init__(False)
 
     def OnInit(self) -> bool:  # noqa: N802 — wx API
+        from .telemetry import init_app_telemetry
+
+        init_app_telemetry(self)
         self.frame = MainFrame(initial_paths=self._pending_paths)
         self._pending_paths.clear()
         self.frame.Show()
@@ -1788,7 +3427,14 @@ class MainFrame(wx.Frame):
         self._overview_progress: wx.ProgressDialog | None = None
         self._overview_progress_timer: wx.Timer | None = None
         self.menu_ai_overview: wx.MenuItem | None = None
+        self.menu_ai_features: wx.MenuItem | None = None
+        self.menu_show_issues_always: wx.MenuItem | None = None
         self._lang_menu_items: dict[str, wx.MenuItem] = {}
+        self._issues_visible = True
+        self._issues_height_delta = 0
+        self._source_filter_wanted = False
+        self._result_icon_cache: dict[tuple[str, int], wx.Bitmap] = {}
+        self._result_icon_key: str | None = None
         self._initial_focus_pending = True
         self._pending_open_paths = list(initial_paths or [])
         self._apply_window_icon()
@@ -1797,8 +3443,14 @@ class MainFrame(wx.Frame):
         self._enable_drag_drop()
         # Lightweight status only — detect_java() is too slow for the UI thread.
         self.SetStatusText(_("Starting…"))
-        self.Centre()
         self.Layout()
+        self._result_icon_key = None
+        self._update_result_status_icon()
+        # Issues start collapsed; centre the compact window.
+        self._set_issues_panel_visible(False, keep_center=False)
+        self.Centre()
+        # Min sizes are unreliable before the first Show; re-check after paint.
+        wx.CallAfter(self._ensure_result_text_height, keep_center=False)
         if sys.platform == "darwin":
             # On macOS, Cocoa assigns first responder to the path TextCtrl when
             # the window activates; wx.SetFocus cannot override that. Use native
@@ -1827,8 +3479,6 @@ class MainFrame(wx.Frame):
         """Append the verdict to the app name in the title bar."""
         if summary:
             clean = " ".join(summary.split())
-            if len(clean) > 80:
-                clean = clean[:77] + "…"
             self.SetTitle(f"{app_title()} — {clean}")
         else:
             self.SetTitle(app_title())
@@ -1905,6 +3555,91 @@ class MainFrame(wx.Frame):
         self.result_label.SetForegroundColour(fg)
         self.result_label.SetBackgroundColour(bg)
         self.result_label.Refresh()
+
+    def _result_icon_display_size(self) -> int:
+        """Square icon edge matching the result text box height."""
+        if hasattr(self, "result_label") and self.result_label is not None:
+            h = self.result_label.GetMinSize().height
+            if h > 0:
+                return h
+        return 72
+
+    def _result_status_icon_key(self) -> str:
+        """Return down / wait / ok / x for the result status graphic."""
+        if self._busy:
+            return "wait"
+        result = self._last_result
+        if result is None:
+            return "down"
+        if result.issues or result.verdict in (Verdict.FAILED, Verdict.ERROR):
+            return "x"
+        return "ok"
+
+    def _result_status_icon_path(self, key: str) -> Path | None:
+        names = {
+            "down": "checkmate-down.png",
+            "wait": "checkmate-wait.png",
+            "ok": "checkmate.png",
+            "x": "checkmate-x.png",
+        }
+        path = images_dir() / names[key]
+        return path if path.is_file() else None
+
+    def _scaled_result_icon_bitmap(self, key: str, size: int) -> wx.Bitmap | None:
+        cached = self._result_icon_cache.get((key, size))
+        if cached is not None and cached.IsOk():
+            return cached
+        path = self._result_status_icon_path(key)
+        if path is None:
+            return None
+        image = wx.Image(str(path), wx.BITMAP_TYPE_PNG)
+        if not image.IsOk():
+            return None
+        if image.GetWidth() != size or image.GetHeight() != size:
+            image = image.Scale(size, size, wx.IMAGE_QUALITY_HIGH)
+        bitmap = wx.Bitmap(image)
+        if not bitmap.IsOk():
+            return None
+        self._result_icon_cache[(key, size)] = bitmap
+        return bitmap
+
+    def _update_result_status_icon(self) -> None:
+        """Show waiting / pass / issues graphic beside the result box."""
+        if not hasattr(self, "result_icon"):
+            return
+        key = self._result_status_icon_key()
+        size = self._result_icon_display_size()
+        if key == self._result_icon_key:
+            current = self.result_icon.GetBitmap()
+            if current.IsOk() and current.GetWidth() == size:
+                return
+        bitmap = self._scaled_result_icon_bitmap(key, size)
+        if bitmap is None:
+            self.result_icon.SetBitmap(wx.NullBitmap)
+            self.result_icon.SetToolTip("")
+            self._result_icon_key = None
+            return
+        self.result_icon.SetMinSize((size, size))
+        self.result_icon.SetSize((size, size))
+        self.result_icon.SetBitmap(bitmap)
+        tip = {
+            "down": _("Waiting for a publication"),
+            "wait": _("Check in progress"),
+            "ok": _("No issues found"),
+            "x": _("Issues found"),
+        }[key]
+        open_hint = _("Click to select a file")
+        self.result_icon.SetToolTip(f"{tip}\n{open_hint}")
+        self.result_icon.SetName(
+            _("Check status: {status}. {action}", status=tip, action=open_hint)
+        )
+        self._result_icon_key = key
+        icon_sizer = getattr(self, "result_icon_sizer", None)
+        if icon_sizer is not None:
+            icon_sizer.Layout()
+        row = getattr(self, "result_row", None)
+        if row is not None:
+            row.Layout()
 
     def _prepare_result_for_review(self) -> None:
         """Select all so screen readers announce the result text on focus."""
@@ -1985,7 +3720,8 @@ class MainFrame(wx.Frame):
         input_sizer.Add(path_row, 0, wx.EXPAND | wx.ALL, 8)
         root.Add(input_sizer, 0, wx.EXPAND | wx.ALL, 10)
 
-        # --- Result ---
+        # --- Result (status icon + summary + action buttons) ---
+        result_row = wx.BoxSizer(wx.HORIZONTAL)
         self.result_box = wx.StaticBox(panel, label=_("Result"))
         result_sizer = wx.StaticBoxSizer(self.result_box, wx.VERTICAL)
         self.result_label = wx.TextCtrl(
@@ -1995,14 +3731,75 @@ class MainFrame(wx.Frame):
             name=_("Check result"),
         )
         font = self.result_label.GetFont()
-        font.SetPointSize(font.GetPointSize() + 2)
+        font.SetPointSize(font.GetPointSize() + 1)
         font.MakeBold()
         self.result_label.SetFont(font)
-        self.result_label.SetMinSize((-1, 72))
+        # Size from real text metrics so four lines are not clipped by chrome.
+        line_h = self.result_label.GetCharHeight()
+        if hasattr(self.result_label, "GetSizeFromTextSize"):
+            text_h = self.result_label.GetSizeFromTextSize(-1, line_h * 4).height
+            text_h = max(text_h + 12, line_h * 4 + 24)
+        else:
+            text_h = line_h * 4 + 36
+        self._result_text_min_height = text_h
+        self.result_label.SetMinSize((-1, text_h))
         self.result_label.Bind(wx.EVT_SET_FOCUS, self.on_result_focus)
         self._set_result_accessible_name(_("No check run yet."))
-        result_sizer.Add(self.result_label, 0, wx.EXPAND | wx.ALL, 8)
-        root.Add(result_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        result_sizer.Add(self.result_label, 1, wx.EXPAND | wx.ALL, 8)
+
+        icon_size = self._result_icon_display_size()
+        self.result_icon = wx.StaticBitmap(panel, size=(icon_size, icon_size))
+        self.result_icon.SetName(_("Check status"))
+        self.result_icon.SetCursor(wx.Cursor(wx.CURSOR_HAND))
+        # Center the bitmap in the result-row height (StaticBitmap paints
+        # top-left inside a taller control on Windows).
+        self.result_icon_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.result_icon_sizer.AddStretchSpacer(1)
+        self.result_icon_sizer.Add(self.result_icon, 0, wx.ALIGN_CENTER)
+        self.result_icon_sizer.AddStretchSpacer(1)
+
+        result_btns = wx.BoxSizer(wx.VERTICAL)
+        self.copy_btn = wx.Button(panel, label=_("&Copy summary"))
+        self.copy_btn.SetToolTip(_("Copy the result summary (Ctrl+Shift+C)"))
+        self.report_btn = wx.Button(panel, label=_("&Report…"))
+        self.report_btn.SetToolTip(
+            _(
+                "View or save reports, copy the summary, or view the full log"
+            )
+        )
+        self.ai_overview_btn = None
+        if fido_settings_present():
+            self.ai_overview_btn = wx.Button(panel, label=_("AI &overview"))
+            self.ai_overview_btn.SetToolTip(
+                _("Generate an AI overview of this report (Ctrl+Shift+A)")
+            )
+        self.show_issues_btn = wx.Button(panel, label=_("Show &issues"))
+        self.show_issues_btn.SetToolTip(_("Show the issues list"))
+        result_action_btns = self._result_action_buttons()
+        for i, btn in enumerate(result_action_btns):
+            border = wx.BOTTOM if i < len(result_action_btns) - 1 else 0
+            result_btns.Add(btn, 0, wx.EXPAND | border, 4 if border else 0)
+        self.result_btns = result_btns
+        self._size_result_action_buttons()
+        self._set_ai_overview_btn_visible(ai_features_enabled())
+        self.result_row = result_row
+        result_row.Add(
+            self.result_icon_sizer, 0, wx.EXPAND | wx.RIGHT, 10
+        )
+        result_row.Add(result_sizer, 1, wx.EXPAND | wx.RIGHT, 12)
+        result_row.Add(result_btns, 0, wx.EXPAND)
+        # Static box chrome (~label + padding) above/around the text box.
+        result_row.SetMinSize(
+            (
+                -1,
+                max(
+                    self._result_text_min_height + 44,
+                    result_btns.GetMinSize().height,
+                ),
+            )
+        )
+        root.Add(result_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self._update_result_status_icon()
 
         # --- Issues ---
         self.issues_box = wx.StaticBox(panel, label=_("Issues"))
@@ -2041,15 +3838,6 @@ class MainFrame(wx.Frame):
         self.unique_codes_cb.SetValue(
             bool(read_settings().get("unique_codes", False))
         )
-        self.copy_btn = wx.Button(panel, label=_("&Copy summary"))
-        self.copy_btn.SetToolTip(_("Copy the result summary (Ctrl+Shift+C)"))
-        self.report_btn = wx.Button(panel, label=_("&Report…"))
-        self.report_btn.SetToolTip(
-            _(
-                "View or save reports, AI overview (when available), "
-                "copy the summary, or view the full log"
-            )
-        )
         self.filter_row = filter_row
         filter_row.Add(self.filter_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
         filter_row.Add(
@@ -2062,11 +3850,8 @@ class MainFrame(wx.Frame):
         filter_row.Show(self.source_label, False)
         filter_row.Show(self.source_choice, False)
         filter_row.Add(
-            self.unique_codes_cb, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12
+            self.unique_codes_cb, 0, wx.ALIGN_CENTER_VERTICAL
         )
-        filter_row.AddStretchSpacer(1)
-        filter_row.Add(self.copy_btn, 0, wx.RIGHT, 4)
-        filter_row.Add(self.report_btn, 0)
 
         self.issues_list = IssuesList(panel, name=_("Issues list"))
         self.issues_list.Bind(wx.EVT_SET_FOCUS, self.on_issues_list_focus)
@@ -2094,6 +3879,7 @@ class MainFrame(wx.Frame):
         issues_sizer.Add(
             self.issues_hint, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8
         )
+        self.issues_sizer = issues_sizer
         root.Add(issues_sizer, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         panel.SetSizer(root)
@@ -2118,25 +3904,25 @@ class MainFrame(wx.Frame):
         menubar.Append(file_menu, _("&File"))
 
         report_menu = wx.Menu()
-        self.menu_view_text = report_menu.Append(
-            wx.ID_ANY, _("View &text report\tCtrl+T")
-        )
-        self.menu_save_text = report_menu.Append(
-            wx.ID_ANY, _("Save &text report…\tCtrl+Shift+S")
-        )
-        report_menu.AppendSeparator()
+        self.menu_ai_overview = None
+        if ai_features_enabled():
+            self.menu_ai_overview = report_menu.Append(
+                wx.ID_ANY, _("AI &overview…\tCtrl+Shift+A")
+            )
+            report_menu.AppendSeparator()
         self.menu_view_html = report_menu.Append(
             wx.ID_ANY, _("View &HTML report in browser\tCtrl+H")
         )
         self.menu_save_html = report_menu.Append(
             wx.ID_SAVEAS, _("Save &HTML report…\tCtrl+S")
         )
-        self.menu_ai_overview = None
-        if fido_settings_present():
-            report_menu.AppendSeparator()
-            self.menu_ai_overview = report_menu.Append(
-                wx.ID_ANY, _("AI &overview…\tCtrl+Shift+A")
-            )
+        report_menu.AppendSeparator()
+        self.menu_view_text = report_menu.Append(
+            wx.ID_ANY, _("View &text report\tCtrl+T")
+        )
+        self.menu_save_text = report_menu.Append(
+            wx.ID_ANY, _("Save &text report…\tCtrl+Shift+S")
+        )
         report_menu.AppendSeparator()
         self.menu_copy = report_menu.Append(
             wx.ID_COPY, _("&Copy summary\tCtrl+Shift+C")
@@ -2148,12 +3934,45 @@ class MainFrame(wx.Frame):
         self.menu_view_log = report_menu.Append(
             wx.ID_ANY, _("View full &log\tCtrl+L")
         )
+        self.menu_view_changelog = report_menu.Append(
+            wx.ID_ANY, _("View edit &changelog…\tCtrl+Shift+G")
+        )
+        self.menu_view_changelog.SetHelp(
+            _(
+                "Open the CheckMate edit changelog for this publication "
+                "(AI fixes and backups), when one exists"
+            )
+        )
         self._report_menu_index = menubar.GetMenuCount()
         menubar.Append(report_menu, _("&Report"))
 
         tools_menu = wx.Menu()
         self.menu_check = tools_menu.Append(
             wx.ID_ANY, _("&Re-check publication\tF5")
+        )
+        tools_menu.AppendSeparator()
+        self.menu_show_issues_always = tools_menu.AppendCheckItem(
+            wx.ID_ANY, _("Show &issues always")
+        )
+        self.menu_show_issues_always.Check(show_issues_always())
+        self.menu_show_issues_always.SetHelp(
+            _(
+                "When checked, open the issues list automatically after a check "
+                "that finds issues (instead of pressing Show issues)"
+            )
+        )
+        tools_menu.AppendSeparator()
+        self.menu_ai_features = tools_menu.AppendCheckItem(
+            wx.ID_ANY, _("Enable &AI features")
+        )
+        ai_available = fido_settings_present()
+        self.menu_ai_features.Enable(ai_available)
+        self.menu_ai_features.Check(ai_available and ai_features_enabled())
+        self.menu_ai_features.SetHelp(
+            _(
+                "Show or hide AI features when FIDO AI is available "
+                "(useful for training)"
+            )
         )
         tools_menu.AppendSeparator()
         self.menu_update = tools_menu.Append(
@@ -2190,6 +4009,49 @@ class MainFrame(wx.Frame):
         self._bind_menus()
         self._update_report_actions_enabled()
 
+    def _result_action_buttons(self) -> list[wx.Button]:
+        buttons = [self.copy_btn, self.report_btn]
+        if self.ai_overview_btn is not None:
+            buttons.append(self.ai_overview_btn)
+        buttons.append(self.show_issues_btn)
+        return buttons
+
+    def _size_result_action_buttons(self) -> None:
+        """Give result-column buttons shared extra width for translations."""
+        buttons = self._result_action_buttons()
+        if not buttons:
+            return
+        # Reset so GetBestSize reflects the current labels.
+        for btn in buttons:
+            btn.SetMinSize(wx.DefaultSize)
+        btn_min_w = max(btn.GetBestSize().width for btn in buttons)
+        btn_min_w = max(btn_min_w + 24, 140)
+        for btn in buttons:
+            btn.SetMinSize((btn_min_w, -1))
+
+    def _set_ai_overview_btn_visible(self, visible: bool) -> None:
+        """Show or hide the AI overview button (remove from layout when off)."""
+        btn = self.ai_overview_btn
+        if btn is None:
+            return
+        self.result_btns.Show(btn, visible)
+        if visible:
+            btn.Show()
+        else:
+            btn.Hide()
+
+    def _apply_ai_features_visibility(self) -> None:
+        """Show or hide AI entry points after the training toggle changes."""
+        enabled = ai_features_enabled()
+        self._set_ai_overview_btn_visible(enabled)
+        self._size_result_action_buttons()
+        self.panel.Layout()
+        self.Layout()
+        self._result_icon_key = None
+        self._update_result_status_icon()
+        # Rebuild so Report → AI overview appears/disappears with the toggle.
+        self._build_menubar()
+
     def _update_report_actions_enabled(self) -> None:
         """Enable Report menu / button only when a check result exists.
 
@@ -2197,6 +4059,7 @@ class MainFrame(wx.Frame):
         greys out correctly on Windows and macOS.
         """
         enabled = self._last_result is not None
+        changelog_ok = self._changelog_path_if_present() is not None
         for item in (
             self.menu_view_text,
             self.menu_save_text,
@@ -2209,17 +4072,27 @@ class MainFrame(wx.Frame):
             item.Enable(enabled)
         if self.menu_ai_overview is not None:
             self.menu_ai_overview.Enable(enabled)
-        self.report_btn.Enable(enabled)
+        self.menu_view_changelog.Enable(changelog_ok)
+        # AI overview is hidden when features are off; only enable when shown.
+        if self.ai_overview_btn is not None and ai_features_enabled():
+            self.ai_overview_btn.Enable(enabled)
+        self.copy_btn.Enable(enabled)
+        self.report_btn.Enable(enabled or changelog_ok)
+        self._update_show_issues_button()
         menubar = self.GetMenuBar()
         if menubar is None:
             return
         idx = getattr(self, "_report_menu_index", -1)
         if 0 <= idx < menubar.GetMenuCount():
-            menubar.EnableTop(idx, enabled)
+            menubar.EnableTop(idx, enabled or changelog_ok)
 
     def _bind(self) -> None:
         self.select_file_btn.Bind(wx.EVT_BUTTON, self.on_browse_file)
         self.select_folder_btn.Bind(wx.EVT_BUTTON, self.on_browse_folder)
+        self.result_icon.Bind(wx.EVT_LEFT_UP, self.on_result_icon_click)
+        if self.ai_overview_btn is not None:
+            self.ai_overview_btn.Bind(wx.EVT_BUTTON, self.on_ai_overview)
+        self.show_issues_btn.Bind(wx.EVT_BUTTON, self.on_show_issues)
         self.copy_btn.Bind(wx.EVT_BUTTON, self.on_copy_summary)
         self.report_btn.Bind(wx.EVT_BUTTON, self.on_report_button)
         self.filter_choice.Bind(wx.EVT_CHOICE, self.on_filter_changed)
@@ -2247,7 +4120,14 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_copy_summary, self.menu_copy)
         self.Bind(wx.EVT_MENU, self.on_clear_results, self.menu_clear)
         self.Bind(wx.EVT_MENU, self.on_check, self.menu_check)
+        self.Bind(
+            wx.EVT_MENU,
+            self.on_toggle_show_issues_always,
+            self.menu_show_issues_always,
+        )
+        self.Bind(wx.EVT_MENU, self.on_toggle_ai_features, self.menu_ai_features)
         self.Bind(wx.EVT_MENU, self.on_view_full_log, self.menu_view_log)
+        self.Bind(wx.EVT_MENU, self.on_view_changelog, self.menu_view_changelog)
         self.Bind(wx.EVT_MENU, self.on_check_updates, self.menu_update)
         self.Bind(wx.EVT_MENU, self.on_reinstall_checker, self.menu_install)
         self.Bind(wx.EVT_MENU, self.on_open_app_log, self.menu_open_app_log)
@@ -2289,6 +4169,7 @@ class MainFrame(wx.Frame):
         self.result_box.SetLabel(_("Result"))
         self.result_label.SetName(_("Check result"))
         self._set_result_accessible_name(self.result_label.GetValue())
+        self._update_result_status_icon()
         self.issues_box.SetLabel(_("Issues"))
         self.filter_label.SetLabel(_("Filter:"))
         self.filter_choice.SetName(_("Issue filter"))
@@ -2314,15 +4195,21 @@ class MainFrame(wx.Frame):
                 "times it occurred. Useful when one rule has many instances."
             )
         )
+        if self.ai_overview_btn is not None:
+            self.ai_overview_btn.SetLabel(_("AI &overview"))
+            self.ai_overview_btn.SetToolTip(
+                _("Generate an AI overview of this report (Ctrl+Shift+A)")
+            )
+        self._update_show_issues_button()
         self.copy_btn.SetLabel(_("&Copy summary"))
         self.copy_btn.SetToolTip(_("Copy the result summary (Ctrl+Shift+C)"))
         self.report_btn.SetLabel(_("&Report…"))
         self.report_btn.SetToolTip(
             _(
-                "View or save reports, AI overview (when available), "
-                "copy the summary, or view the full log"
+                "View or save reports, copy the summary, or view the full log"
             )
         )
+        self._size_result_action_buttons()
         self.issues_list.SetName(_("Issues list"))
         self.issues_list.SetColumnTitles(
             (_("Severity"), _("Source"), _("Code"), _("Location"), _("Message"))
@@ -2337,6 +4224,99 @@ class MainFrame(wx.Frame):
         else:
             self._show_result_text(_("No check run yet."), title=None)
         self._update_status_bar()
+        self.panel.Layout()
+        self.Layout()
+
+    def _update_show_issues_button(self) -> None:
+        has_issues = (
+            self._last_result is not None and bool(self._last_result.issues)
+        )
+        if not has_issues and self._issues_visible:
+            self._set_issues_panel_visible(False)
+            return
+        if has_issues and show_issues_always() and not self._issues_visible:
+            self._set_issues_panel_visible(True)
+            return
+        self.show_issues_btn.Enable(has_issues)
+        if self._issues_visible:
+            self.show_issues_btn.SetLabel(_("Hide &issues"))
+            self.show_issues_btn.SetToolTip(_("Hide the issues list"))
+        else:
+            self.show_issues_btn.SetLabel(_("Show &issues"))
+            self.show_issues_btn.SetToolTip(_("Show the issues list"))
+
+    def _set_issues_panel_visible(
+        self, visible: bool, *, keep_center: bool = True
+    ) -> None:
+        """Show or hide the Issues frame, keeping the window vertically centred."""
+        if visible == self._issues_visible:
+            return
+
+        old_rect = self.GetRect()
+        non_client_h = old_rect.height - self.GetClientSize().height
+
+        if not visible:
+            # Measure how much height the issues block contributes before hiding.
+            issues_h = self.issues_sizer.GetSize().height
+            item = self.root_sizer.GetItem(self.issues_sizer)
+            border = item.GetBorder() if item is not None else 10
+            # LEFT|RIGHT|BOTTOM → bottom margin only adds to height.
+            self._issues_height_delta = max(issues_h + border, 0)
+
+        self.root_sizer.Show(self.issues_sizer, visible, recursive=True)
+        self.issues_box.Show(visible)
+        self._issues_visible = visible
+        # Re-apply Source visibility after the flag changes: showing those
+        # controls while Issues is collapsed parks them at the panel origin.
+        self._apply_source_filter_visibility()
+        self.panel.Layout()
+        self.Layout()
+
+        # Never shrink below the laid-out minimum — that was clipping the
+        # result text box to three lines when Issues started collapsed.
+        min_frame_h = non_client_h + max(self.root_sizer.GetMinSize().height, 1)
+        if visible:
+            new_h = max(old_rect.height + self._issues_height_delta, min_frame_h)
+        else:
+            new_h = max(old_rect.height - self._issues_height_delta, min_frame_h)
+
+        if keep_center:
+            new_y = old_rect.y + (old_rect.height - new_h) // 2
+            if new_y < 0:
+                new_y = 0
+            self.SetSize(old_rect.x, new_y, old_rect.width, new_h)
+        else:
+            # Startup: Centre() runs immediately afterwards.
+            self.SetSize(old_rect.width, new_h)
+
+        self._update_show_issues_button()
+        self._size_result_action_buttons()
+        self.panel.Layout()
+        self.Layout()
+        # If the result text was still squeezed (common after collapsing Issues),
+        # grow the frame by the shortfall so all four lines remain visible.
+        self._ensure_result_text_height(keep_center=keep_center)
+
+    def _ensure_result_text_height(self, *, keep_center: bool) -> None:
+        """Grow the frame when the result text box is below its four-line min."""
+        need = getattr(self, "_result_text_min_height", 0)
+        if need <= 0 or not hasattr(self, "result_label"):
+            return
+        have = self.result_label.GetSize().height
+        deficit = need - have
+        if deficit <= 0:
+            return
+        rect = self.GetRect()
+        new_h = rect.height + deficit
+        if keep_center:
+            new_y = rect.y - deficit // 2
+            if new_y < 0:
+                new_y = 0
+            self.SetSize(rect.x, new_y, rect.width, new_h)
+        else:
+            self.SetSize(rect.width, new_h)
+        min_w = self.GetMinSize().width
+        self.SetMinSize((min_w, max(self.GetMinSize().height, new_h)))
         self.panel.Layout()
         self.Layout()
 
@@ -2369,8 +4349,10 @@ class MainFrame(wx.Frame):
                 if detect_java() is None:
                     wx.PostEvent(self, JavaMissingEvent())
 
-                def progress(msg: str) -> None:
-                    wx.PostEvent(self, ProgressEvent(message=msg))
+                def progress(msg: str, *, announce: bool = True) -> None:
+                    wx.PostEvent(
+                        self, ProgressEvent(message=msg, announce=announce)
+                    )
 
                 ensure_tools_installed(progress=progress)
                 # One-time after install/upgrade: run each tool once so AV
@@ -2457,14 +4439,17 @@ class MainFrame(wx.Frame):
         self.source_choice.SetSelection(0)
         self._set_source_filter_visible(False)
         self._update_report_actions_enabled()
+        self._update_result_status_icon()
         self._update_status_bar()
         self._focus_select_button()
 
-    def _set_busy(self, busy: bool) -> None:
+    def _set_busy(self, busy: bool, *, update_icon: bool = True) -> None:
         self._busy = busy
         self.select_file_btn.Enable(not busy)
         self.select_folder_btn.Enable(not busy)
         self.path_ctrl.Enable(not busy)
+        if update_icon:
+            self._update_result_status_icon()
 
     def _current_path(self) -> Path | None:
         text = self.path_ctrl.GetValue().strip().strip('"')
@@ -2645,7 +4630,17 @@ class MainFrame(wx.Frame):
 
         result_code = dlg.ShowModal()
         pending = getattr(dlg, "applied_fix_verify", None)
-        dlg.Destroy()
+        try:
+            dlg.Destroy()
+        except RuntimeError:
+            pass
+        # ProgressDialog / WebView modal teardown can leave the frame disabled.
+        try:
+            self.Enable(True)
+            self.Raise()
+            _win_force_foreground(self)
+        except RuntimeError:
+            pass
         if result_code == wx.ID_APPLY:
             # Apply fix succeeded — re-scan, then confirm resolution / offer revert.
             self._pending_fix_verify = pending
@@ -2673,12 +4668,25 @@ class MainFrame(wx.Frame):
         return names[idx - 1]
 
     def _set_source_filter_visible(self, visible: bool) -> None:
-        """Show or hide the Source filter (only useful for multi-checker runs)."""
-        self.filter_row.Show(self.source_label, visible)
-        self.filter_row.Show(self.source_choice, visible)
-        self.source_label.Enable(visible)
-        self.source_choice.Enable(visible)
-        self.panel.Layout()
+        """Remember whether Source filter is wanted; show only if Issues is open."""
+        self._source_filter_wanted = visible
+        self._apply_source_filter_visibility()
+
+    def _apply_source_filter_visibility(self) -> None:
+        """Map Source filter wanted-state onto the screen.
+
+        The Issues panel starts collapsed. Showing Source while that panel is
+        hidden makes wx place the controls at the panel origin.
+        """
+        show = bool(self._source_filter_wanted and self._issues_visible)
+        self.filter_row.Show(self.source_label, show)
+        self.filter_row.Show(self.source_choice, show)
+        self.source_label.Show(show)
+        self.source_choice.Show(show)
+        self.source_label.Enable(self._source_filter_wanted)
+        self.source_choice.Enable(self._source_filter_wanted)
+        if self._issues_visible:
+            self.panel.Layout()
 
     def _sync_source_filter_choices(
         self,
@@ -2716,8 +4724,15 @@ class MainFrame(wx.Frame):
         self._sync_source_filter_choices(prefer=None, reset_to_all=True)
         self._populate_issues()
         self._update_report_actions_enabled()
+        self._update_result_status_icon()
         self._update_status_bar()
         self._announce_result_pane()
+        try:
+            from .telemetry import log_check
+
+            log_check(result)
+        except Exception:
+            pass
 
     def _summary_text(self) -> str:
         result = self._last_result
@@ -2727,7 +4742,14 @@ class MainFrame(wx.Frame):
 
     # --- Events ---
 
-    def on_browse_file(self, _event: wx.CommandEvent) -> None:
+    def on_result_icon_click(self, event: wx.MouseEvent) -> None:
+        """Status icon acts as a shortcut for Select file…"""
+        event.Skip()
+        if self._busy:
+            return
+        self.on_browse_file(None)
+
+    def on_browse_file(self, _event: wx.CommandEvent | None) -> None:
         with wx.FileDialog(
             self,
             _("Select an eBraille, EPUB, or PDF publication"),
@@ -2788,8 +4810,10 @@ class MainFrame(wx.Frame):
         self.issues_list.DeleteAllItems()
 
         def worker() -> None:
-            def progress(msg: str) -> None:
-                wx.PostEvent(self, ProgressEvent(message=msg))
+            def progress(msg: str, *, announce: bool = True) -> None:
+                wx.PostEvent(
+                    self, ProgressEvent(message=msg, announce=announce)
+                )
 
             result = run_check(path, exploded=None, progress=progress)
             wx.PostEvent(self, ResultEvent(result=result))
@@ -2806,13 +4830,24 @@ class MainFrame(wx.Frame):
             elif not self._busy:
                 self._restore_result_display()
             return
-        # Move focus into the result pane so progress is announced (checks and
-        # one-time first-use warm-up). Selecting the text is what screen readers
-        # pick up as a change.
-        self._show_result_text(event.message, update_title=False, focus=True)
+        announce = bool(getattr(event, "announce", True))
+        if announce:
+            # Move focus into the result pane so progress is announced (checks
+            # and one-time first-use warm-up). Selecting the text is what screen
+            # readers pick up as a change.
+            self._show_result_text(
+                event.message, update_title=False, focus=True
+            )
+            return
+        # Living updates (Ace stream / elapsed timer): refresh the text without
+        # stealing focus or re-announcing under focus.
+        self.result_label.ChangeValue(event.message)
+        self._set_result_accessible_name(event.message)
 
     def on_result_event(self, event: ResultEvent) -> None:
-        self._set_busy(False)
+        # Defer icon refresh until _apply_result so we don't flash the previous
+        # (or idle) status between clearing busy and loading the new verdict.
+        self._set_busy(False, update_icon=False)
         pending = self._pending_fix_verify
         self._pending_fix_verify = None
         self._apply_result(event.result)
@@ -2836,6 +4871,9 @@ class MainFrame(wx.Frame):
                 "The publication was changed, but the re-check could not be completed.\n\n"
                 "{detail}"
             ).format(detail=(result.error_message or "").strip() or _("Unknown error."))
+            changelog = getattr(pending, "changelog_path", "") or ""
+            if changelog:
+                msg += "\n\n" + _("Edit log:\n{path}").format(path=changelog)
             if has_backup:
                 msg += "\n\n" + _(
                     "Do you want to revert to the backup created before the fix?"
@@ -2848,14 +4886,72 @@ class MainFrame(wx.Frame):
                 )
                 if answer == wx.YES:
                     self._revert_applied_fix(pending)
+                else:
+                    try:
+                        from .edit_log import log_fix_validation
+
+                        log_fix_validation(
+                            target_path=pending.target_path,
+                            issue=pending.issue,
+                            backup_path=pending.backup_path,
+                            outcome="recheck_failed_kept",
+                            detail=result.error_message or "",
+                        )
+                    except OSError:
+                        pass
             else:
+                try:
+                    from .edit_log import log_fix_validation
+
+                    log_fix_validation(
+                        target_path=pending.target_path,
+                        issue=pending.issue,
+                        backup_path=pending.backup_path,
+                        outcome="recheck_failed_no_backup",
+                        detail=result.error_message or "",
+                    )
+                except OSError:
+                    pass
                 wx.MessageBox(msg, _("Re-check failed"), wx.OK | wx.ICON_WARNING, self)
             return
 
-        report = evaluate_fix_outcome(pending.issue, pending.before_result, result)
+        report = evaluate_fix_outcome(
+            pending.issue,
+            pending.before_result,
+            result,
+            batch_mode=bool(getattr(pending, "batch_mode", False)),
+        )
         lines: list[str] = []
 
-        if report.target_resolved:
+        if report.batch_mode:
+            if report.target_resolved:
+                lines.append(
+                    _(
+                        "All matching issues with code {code} appear to be resolved "
+                        "({before} → {after})."
+                    ).format(
+                        code=pending.issue.code or _("(no code)"),
+                        before=report.matched_before,
+                        after=report.matched_after,
+                    )
+                )
+            else:
+                lines.append(
+                    _(
+                        "Matching issues with code {code}: {before} before, "
+                        "{after} after the batch fix."
+                    ).format(
+                        code=pending.issue.code or _("(no code)"),
+                        before=report.matched_before,
+                        after=report.matched_after,
+                    )
+                )
+            patch_count = int(getattr(pending, "patch_count", 0) or 0)
+            if patch_count:
+                lines.append(
+                    _("Patches applied: {n}.").format(n=patch_count)
+                )
+        elif report.target_resolved:
             lines.append(
                 _("The targeted issue appears to be resolved (code: {code}).").format(
                     code=pending.issue.code or _("(no code)")
@@ -2922,7 +5018,23 @@ class MainFrame(wx.Frame):
 
         body = "\n".join(lines)
 
+        changelog = getattr(pending, "changelog_path", "") or ""
+        if changelog:
+            body += "\n\n" + _("Edit log:\n{path}").format(path=changelog)
+
         if not report.has_concerns:
+            try:
+                from .edit_log import log_fix_validation
+
+                log_fix_validation(
+                    target_path=pending.target_path,
+                    issue=pending.issue,
+                    backup_path=pending.backup_path,
+                    outcome="confirmed",
+                    detail=_("The targeted issue appears to be resolved."),
+                )
+            except OSError:
+                pass
             wx.MessageBox(
                 body,
                 _("Fix confirmed"),
@@ -2932,6 +5044,18 @@ class MainFrame(wx.Frame):
             return
 
         if not has_backup:
+            try:
+                from .edit_log import log_fix_validation
+
+                log_fix_validation(
+                    target_path=pending.target_path,
+                    issue=pending.issue,
+                    backup_path=pending.backup_path,
+                    outcome="concerns_no_backup",
+                    detail=body,
+                )
+            except OSError:
+                pass
             wx.MessageBox(
                 body
                 + "\n\n"
@@ -2955,12 +5079,27 @@ class MainFrame(wx.Frame):
         )
         if answer == wx.YES:
             self._revert_applied_fix(pending)
+        else:
+            try:
+                from .edit_log import log_fix_validation
+
+                log_fix_validation(
+                    target_path=pending.target_path,
+                    issue=pending.issue,
+                    backup_path=pending.backup_path,
+                    outcome="concerns_kept",
+                    detail=body,
+                )
+            except OSError:
+                pass
 
     def _revert_applied_fix(self, pending) -> None:
         from .epub_package import restore_from_backup
 
         try:
             restore_from_backup(pending.backup_path, pending.restore_to)
+            for bak, restore_to in getattr(pending, "extra_backups", None) or []:
+                restore_from_backup(bak, restore_to)
         except OSError as exc:
             wx.MessageBox(
                 _("Could not revert to the backup:\n{detail}").format(detail=str(exc)),
@@ -2969,8 +5108,23 @@ class MainFrame(wx.Frame):
                 self,
             )
             return
+        try:
+            from .edit_log import log_fix_reverted
+
+            log_fix_reverted(
+                target_path=pending.target_path,
+                issue=pending.issue,
+                backup_path=pending.backup_path,
+                restore_to=pending.restore_to,
+            )
+        except OSError:
+            pass
+        revert_msg = _("The publication was reverted to the backup.")
+        changelog = getattr(pending, "changelog_path", "") or ""
+        if changelog:
+            revert_msg += "\n\n" + _("Edit log:\n{path}").format(path=changelog)
         wx.MessageBox(
-            _("The publication was reverted to the backup."),
+            revert_msg,
             _("Reverted"),
             wx.OK | wx.ICON_INFORMATION,
             self,
@@ -2983,6 +5137,18 @@ class MainFrame(wx.Frame):
     def on_unique_codes_changed(self, _event: wx.CommandEvent) -> None:
         update_settings(unique_codes=bool(self.unique_codes_cb.GetValue()))
         self._populate_issues()
+
+    def on_toggle_ai_features(self, _event: wx.CommandEvent) -> None:
+        if not fido_settings_present():
+            return
+        update_settings(ai_features_enabled=bool(self.menu_ai_features.IsChecked()))
+        self._apply_ai_features_visibility()
+
+    def on_toggle_show_issues_always(self, _event: wx.CommandEvent) -> None:
+        enabled = bool(self.menu_show_issues_always.IsChecked())
+        update_settings(show_issues_always=enabled)
+        # Apply immediately when turning on and a result already has issues.
+        self._update_show_issues_button()
 
     def on_issues_list_focus(self, event: wx.FocusEvent) -> None:
         event.Skip()
@@ -3003,6 +5169,9 @@ class MainFrame(wx.Frame):
             wx.TheClipboard.SetData(wx.TextDataObject(text))
             wx.TheClipboard.Close()
 
+    def on_show_issues(self, _event: wx.CommandEvent) -> None:
+        self._set_issues_panel_visible(not self._issues_visible)
+
     def on_clear_results(self, _event: wx.CommandEvent) -> None:
         if self._busy:
             wx.MessageBox(
@@ -3018,31 +5187,76 @@ class MainFrame(wx.Frame):
 
     def on_report_button(self, _event: wx.CommandEvent) -> None:
         menu = wx.Menu()
-        view_text = menu.Append(wx.ID_ANY, _("View &text report\tCtrl+T"))
-        save_text = menu.Append(wx.ID_ANY, _("Save &text report…\tCtrl+Shift+S"))
-        menu.AppendSeparator()
         view_html = menu.Append(wx.ID_ANY, _("View &HTML report in browser\tCtrl+H"))
         save_html = menu.Append(wx.ID_ANY, _("Save &HTML report…\tCtrl+S"))
-        overview_item = None
-        if fido_settings_present():
-            menu.AppendSeparator()
-            overview_item = menu.Append(wx.ID_ANY, _("AI &overview…\tCtrl+Shift+A"))
+        menu.AppendSeparator()
+        view_text = menu.Append(wx.ID_ANY, _("View &text report\tCtrl+T"))
+        save_text = menu.Append(wx.ID_ANY, _("Save &text report…\tCtrl+Shift+S"))
         menu.AppendSeparator()
         copy_item = menu.Append(wx.ID_ANY, _("&Copy summary\tCtrl+Shift+C"))
         clear_item = menu.Append(wx.ID_ANY, _("C&lear results\tCtrl+Shift+N"))
         menu.AppendSeparator()
         log_item = menu.Append(wx.ID_ANY, _("View full &log\tCtrl+L"))
-        menu.Bind(wx.EVT_MENU, self.on_view_text_report, view_text)
-        menu.Bind(wx.EVT_MENU, self.on_save_text_report, save_text)
+        changelog_item = menu.Append(wx.ID_ANY, _("View edit &changelog…\tCtrl+Shift+G"))
+        changelog_item.Enable(self._changelog_path_if_present() is not None)
         menu.Bind(wx.EVT_MENU, self.on_view_html_report, view_html)
         menu.Bind(wx.EVT_MENU, self.on_save_html_report, save_html)
-        if overview_item is not None:
-            menu.Bind(wx.EVT_MENU, self.on_ai_overview, overview_item)
+        menu.Bind(wx.EVT_MENU, self.on_view_text_report, view_text)
+        menu.Bind(wx.EVT_MENU, self.on_save_text_report, save_text)
         menu.Bind(wx.EVT_MENU, self.on_copy_summary, copy_item)
         menu.Bind(wx.EVT_MENU, self.on_clear_results, clear_item)
         menu.Bind(wx.EVT_MENU, self.on_view_full_log, log_item)
+        menu.Bind(wx.EVT_MENU, self.on_view_changelog, changelog_item)
         self.PopupMenu(menu)
         menu.Destroy()
+
+    def _current_publication_path(self) -> Path | None:
+        """Best path for the publication currently in focus (result or path field)."""
+        if self._last_result is not None and self._last_result.target_path:
+            path = Path(self._last_result.target_path).expanduser()
+            if path.exists():
+                return path
+        path = self._current_path()
+        if path is not None:
+            path = path.expanduser()
+            if path.exists():
+                return path
+        return None
+
+    def _changelog_path_if_present(self) -> Path | None:
+        from .edit_log import find_changelog
+
+        return find_changelog(self._current_publication_path())
+
+    def on_view_changelog(self, _event: wx.CommandEvent) -> None:
+        path = self._changelog_path_if_present()
+        if path is None:
+            wx.MessageBox(
+                _(
+                    "No CheckMate edit changelog was found for this publication.\n\n"
+                    "A changelog is created beside the file (or inside an exploded "
+                    "folder) when you apply an AI fix."
+                ),
+                _("No changelog"),
+                wx.OK | wx.ICON_INFORMATION,
+                self,
+            )
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            wx.MessageBox(
+                _("Could not read the changelog:\n{error}").format(error=exc),
+                _("Error"),
+                wx.OK | wx.ICON_ERROR,
+                self,
+            )
+            return
+        from .changelog_dialog import ChangelogDialog
+
+        dlg = ChangelogDialog(self, path=path, markdown_text=text)
+        dlg.ShowModal()
+        dlg.Destroy()
 
     def _require_result(self, empty_title: str) -> CheckResult | None:
         if self._last_result is None:
@@ -3159,7 +5373,7 @@ class MainFrame(wx.Frame):
             self._close_overview_progress()
 
     def on_ai_overview(self, _event: wx.CommandEvent) -> None:
-        if not fido_settings_present():
+        if not ai_features_enabled():
             return
         if self._busy:
             wx.MessageBox(
@@ -3184,37 +5398,45 @@ class MainFrame(wx.Frame):
             parent=self,
             style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT,
         )
+        _present_progress_dialog(
+            self._overview_progress, _("Loading AI libraries…")
+        )
         self._overview_progress_timer = wx.Timer(self)
         self.Bind(
             wx.EVT_TIMER, self._on_overview_progress_timer, self._overview_progress_timer
         )
         self._overview_progress_timer.Start(200)
-
-        from .ai.litellm_client import preload_litellm
-
-        ok, detail = preload_litellm()
-        if not ok:
-            self._close_overview_progress()
-            from .ai.explain import error_message_for_key
-
-            wx.MessageBox(
-                error_message_for_key("no_litellm", detail=detail),
-                _("AI overview"),
-                wx.OK | wx.ICON_ERROR,
-                self,
-            )
-            return
-
-        try:
-            self._overview_progress.Pulse(_("Checking AI connection…"))
-        except RuntimeError:
-            pass
         status_cb = self._overview_status_callback
 
         def work() -> None:
-            from .ai.explain import ExplainResult
+            from .ai.explain import ExplainResult, error_message_for_key
+            from .ai.litellm_client import preload_litellm
             from .ai.overview import explain_overview
 
+            ok, detail = preload_litellm()
+            if not ok:
+                def fail() -> None:
+                    self._close_overview_progress()
+                    wx.MessageBox(
+                        error_message_for_key("no_litellm", detail=detail),
+                        _("AI overview"),
+                        wx.OK | wx.ICON_ERROR,
+                        self,
+                    )
+
+                wx.CallAfter(fail)
+                return
+            if cancel.is_set():
+                return
+
+            def _checking() -> None:
+                if self._overview_progress is not None:
+                    try:
+                        self._overview_progress.Pulse(_("Checking AI connection…"))
+                    except RuntimeError:
+                        pass
+
+            wx.CallAfter(_checking)
             try:
                 out = explain_overview(
                     result,
@@ -3250,6 +5472,13 @@ class MainFrame(wx.Frame):
             wx.MessageBox(msg, _("AI overview"), wx.OK | wx.ICON_ERROR, self)
             return
 
+        try:
+            from .telemetry import log_ai_overview
+
+            log_ai_overview()
+        except Exception:
+            pass
+
         progress = wx.ProgressDialog(
             _("AI overview"),
             _("Loading AI view…"),
@@ -3262,7 +5491,10 @@ class MainFrame(wx.Frame):
             progress.Pulse(_("Loading AI view…"))
             wx.SafeYield(self, True)
             dlg = AiOverviewDialog(
-                self, markdown_text=out.text or "", result=check_result
+                self,
+                markdown_text=out.text or "",
+                result=check_result,
+                session=out.session,
             )
             dlg._realize_ai_html_view()
         finally:
@@ -3272,7 +5504,16 @@ class MainFrame(wx.Frame):
                 pass
         if dlg is not None:
             dlg.ShowModal()
-            dlg.Destroy()
+            try:
+                dlg.Destroy()
+            except RuntimeError:
+                pass
+            try:
+                self.Enable(True)
+                self.Raise()
+                _win_force_foreground(self)
+            except RuntimeError:
+                pass
 
     def on_save_text_report(self, _event: wx.CommandEvent) -> None:
         result = self._require_result(_("Nothing to save"))
@@ -3516,8 +5757,10 @@ class MainFrame(wx.Frame):
         def worker() -> None:
             try:
 
-                def progress(msg: str) -> None:
-                    wx.PostEvent(self, ProgressEvent(message=msg))
+                def progress(msg: str, *, announce: bool = True) -> None:
+                    wx.PostEvent(
+                        self, ProgressEvent(message=msg, announce=announce)
+                    )
 
                 paths: list[str] = []
                 for release in releases:

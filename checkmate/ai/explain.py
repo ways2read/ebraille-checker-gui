@@ -11,7 +11,7 @@ from ..i18n import _, get_language, language_display_name
 from ..models import CheckResult, Issue
 from .context import gather_issue_context
 from .litellm_client import ensure_credentials_ready, litellm_available
-from .resources import resources_prompt_block
+from .resources import authoritative_guidance_for_explain, resources_prompt_block
 from .session import ExplainSession, ProviderError
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,7 @@ def build_system_prompt(issue: Issue) -> str:
     lang = _language_name()
     lang_code = get_language()
     resources = resources_prompt_block(issue)
+    guidance = authoritative_guidance_for_explain(issue)
     h1, h2, h3, h4, h5 = _section_headings()
     return f"""You are an accessibility publishing assistant inside CheckMate, a validation tool.
 Explain checker messages clearly to publishers and remediators. Be accurate and practical.
@@ -64,9 +65,9 @@ Structure your reply with these exact markdown headings (and no others as top-le
 ## {h4}
 ## {h5}
 
+{guidance}
+
 Rules:
-- Do not invent conformance requirements. If unsure, say what to verify.
-- Prefer concrete markup/CSS/OPF steps for EPUB and eBraille.
 - In "{h5}", use only the trusted resources listed below (you may omit irrelevant ones).
 - In "{h5}", write each resource as a markdown link: `[Title](https://example.com/)`.
 - Do not offer to rewrite the whole book; focus on this issue.
@@ -278,13 +279,19 @@ def ask_followup(
         return ExplainResult(ok=False, error_key="cancelled", session=session)
 
     lang = _language_name()
+    h1, h2, h3, h4, h5 = _section_headings()
     _status(status_callback, _("Thinking…"))
     logger.info("Follow-up request starting model=%s", session.model)
     try:
         text = session.followup(
             f"Follow-up question about the same issue.\n"
             f"Reply entirely in {lang}.\n\n"
-            f"{q}"
+            f"Answer this question directly in a natural, conversational way. "
+            f"Do NOT reuse the structured explanation layout with headings such as "
+            f"## {h1}, ## {h2}, ## {h3}, ## {h4}, or ## {h5}. "
+            f"Prefer short paragraphs or a few bullets; include a brief code example "
+            f"only when it helps. Stay focused on what was asked.\n\n"
+            f"Question:\n{q}"
         )
     except ProviderError as e:
         return ExplainResult(
